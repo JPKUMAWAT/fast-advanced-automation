@@ -43,10 +43,9 @@ You need `go`, `python3`, `pip3` and `git` already installed. Then install every
 chmod +x scripts/install.sh
 
 # Core tools only (enough to run recon.sh with no module flags)
-./scripts/install.sh
-
+bash install.sh
 # Everything — core + every optional module tool (needed for --full)
-./scripts/install.sh --full
+bash install.sh --full
 ```
 
 The installer skips any tool that's already on your `$PATH`, so it's safe to re-run any time. After it finishes, add Go's bin directory and `~/.local/bin` to your shell profile (the installer prints the exact line to add):
