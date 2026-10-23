@@ -134,11 +134,74 @@ go_install subzy            github.com/PentestPad/subzy
 go_install gowitness        github.com/sensepost/gowitness
 go_install notify           github.com/projectdiscovery/notify/cmd/notify
 
+# Extra asset-discovery sources
+go_install amass            github.com/owasp-amass/amass/v4/cmd/amass
+go_install chaos            github.com/projectdiscovery/chaos-client/cmd/chaos
+
+# Active DNS bruteforce + permutation
+go_install puredns          github.com/d3mondev/puredns/v2
+go_install dnsgen           github.com/ProjectAnte/dnsgen
+if have massdns; then
+  ok "massdns already installed, skipping"
+else
+  log "Installing massdns (build from source)..."
+  git clone -q https://github.com/blechschmidt/massdns.git "$HOME/.tools/massdns" 2>/dev/null
+  (cd "$HOME/.tools/massdns" && make >/dev/null 2>&1 && cp bin/massdns "$HOME/.local/bin/massdns" 2>/dev/null)
+  have massdns && ok "massdns installed" || warn "massdns build failed — build manually from https://github.com/blechschmidt/massdns"
+fi
+
+# Alternate crawlers
+go_install gospider         github.com/jaeles-project/gospider
+go_install hakrawler        github.com/hakluke/hakrawler
+
+# Hidden parameter discovery + API route bruteforce
+pip_install arjun arjun
+if have paramspider; then
+  ok "paramspider already installed, skipping"
+else
+  log "Installing paramspider (git clone)..."
+  git clone -q https://github.com/devanshbatham/ParamSpider.git "$HOME/.tools/ParamSpider" 2>/dev/null
+  pip3 install --user --break-system-packages -e "$HOME/.tools/ParamSpider" >/dev/null 2>&1
+  ok "paramspider installed"
+fi
+go_install kr github.com/assetnote/kiterunner/cmd/kr  # binary AND command are both 'kr', not 'kiterunner'
+
+# JS endpoint/secret extraction
+pip_install linkfinder   linkfinder || true
+if [ ! -d "$HOME/.tools/LinkFinder" ]; then
+  log "Installing LinkFinder (git clone)..."
+  git clone -q https://github.com/GerbenJavado/LinkFinder.git "$HOME/.tools/LinkFinder" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$HOME/.tools/LinkFinder/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/.tools/LinkFinder/linkfinder.py "$@"\n' "$HOME" > "$HOME/.local/bin/linkfinder" 2>/dev/null
+  chmod +x "$HOME/.local/bin/linkfinder" 2>/dev/null
+  ok "LinkFinder installed (wrapper in ~/.local/bin)"
+fi
+if [ ! -d "$HOME/.tools/SecretFinder" ]; then
+  log "Installing SecretFinder (git clone)..."
+  git clone -q https://github.com/m4ll0k/SecretFinder.git "$HOME/.tools/SecretFinder" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$HOME/.tools/SecretFinder/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/.tools/SecretFinder/SecretFinder.py "$@"\n' "$HOME" > "$HOME/.local/bin/secretfinder" 2>/dev/null
+  chmod +x "$HOME/.local/bin/secretfinder" 2>/dev/null
+  ok "SecretFinder installed (wrapper in ~/.local/bin)"
+fi
+
+# XSS + SQLi (opt-in, detection-focused)
+go_install dalfox github.com/hahwul/dalfox/v2
+if have sqlmap; then
+  ok "sqlmap already installed, skipping"
+else
+  log "Installing sqlmap (git clone)..."
+  git clone -q --depth 1 https://github.com/sqlmapproject/sqlmap.git "$HOME/.tools/sqlmap" 2>/dev/null
+  printf '#!/usr/bin/env bash\npython3 %s/.tools/sqlmap/sqlmap.py "$@"\n' "$HOME" > "$HOME/.local/bin/sqlmap" 2>/dev/null
+  chmod +x "$HOME/.local/bin/sqlmap" 2>/dev/null
+  ok "sqlmap installed (wrapper in ~/.local/bin) — use --sqli only with explicit program authorization"
+fi
+
 pip_install wafw00f wafw00f
 pip_install cloud_enum cloudenum
 
-# S3Scanner — go-installable alternative
-go_install S3Scanner github.com/sa7mon/s3scanner
+# S3Scanner — go-installable; the actual binary name is lowercase 's3scanner'
+go_install s3scanner github.com/sa7mon/s3scanner
 
 # Corsy — git clone, python script
 if have corsy || [ -d "$HOME/.tools/Corsy" ]; then
@@ -170,6 +233,14 @@ if have nuclei; then
   nuclei -update-templates -silent >/dev/null 2>&1 && ok "nuclei templates updated"
 fi
 
+# System packages used by a couple of optional modules (curl is almost always
+# present; dig comes from dnsutils/bind-utils and isn't always installed by default)
+if ! have dig; then
+  warn "dig not found (needed for --shodan). Install it with:"
+  echo "    sudo apt install dnsutils      # Debian/Ubuntu/Kali"
+  echo "    sudo yum install bind-utils    # RHEL/CentOS"
+fi
+
 echo ""
 ok "Full install pass complete."
 echo ""
@@ -180,4 +251,11 @@ log "Add the line above to your ~/.bashrc or ~/.zshrc, then run:"
 echo "    source ~/.bashrc"
 echo ""
 log "Verify everything is reachable with:"
-echo "    which subfinder dnsx httpx nuclei naabu katana gau ffuf subjs trufflehog gowitness"
+echo "    which subfinder dnsx httpx nuclei naabu katana gau ffuf subjs trufflehog gowitness amass dalfox arjun"
+echo ""
+log "Not installed by this script — manual interception/testing tools:"
+echo "    Burp Suite:  https://portswigger.net/burp"
+echo "    Caido:       https://caido.io"
+echo "    OWASP ZAP:   https://www.zaproxy.org"
+echo "    These are interactive proxies, not CLI recon tools — use them by hand"
+echo "    on the interesting hosts/endpoints recon.sh surfaces."
