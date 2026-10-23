@@ -312,8 +312,12 @@ ok "Subdomain enumeration complete"
 # PHASE 2: Merge, Dedup, Clean
 # ========================================================================
 log "Phase 2: Merging and deduplicating"
+# The pattern matches the bare target domain ITSELF as well as any subdomain of it.
+# Without the "(label.)?" prefix being optional, a target that is already a
+# subdomain (e.g. press.priceline.com) with no further sub-subdomains discovered
+# would get filtered down to zero results and the whole run would exit early.
 cat raw/*.txt 2>/dev/null \
-  | grep -E "^[a-zA-Z0-9._-]+\.${DOMAIN//./\\.}$" \
+  | grep -E "^([a-zA-Z0-9._-]+\.)?${DOMAIN//./\\.}$" \
   | tr '[:upper:]' '[:lower:]' \
   | sort -u > final/all_subs.txt
 TOTAL_RAW=$(cat raw/*.txt 2>/dev/null | wc -l)
