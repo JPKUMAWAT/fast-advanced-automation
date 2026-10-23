@@ -126,8 +126,20 @@ go_install gau              github.com/lc/gau/v2/cmd/gau
 go_install waybackurls      github.com/tomnomnom/waybackurls
 go_install ffuf             github.com/ffuf/ffuf/v2
 go_install subjs            github.com/lc/subjs
-go_install trufflehog       github.com/trufflesecurity/trufflehog/v3
-go_install gitleaks         github.com/gitleaks/gitleaks/v8
+if have trufflehog; then
+  ok "trufflehog already installed, skipping"
+else
+  # trufflehog's own go.mod uses replace directives, so `go install` always
+  # fails with "must not contain directives..." — their official installer
+  # script is the only reliable method.
+  log "Installing trufflehog (official install script)..."
+  curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+    | sh -s -- -b "$HOME/.local/bin" >/dev/null 2>&1
+  have trufflehog && ok "trufflehog installed" || warn "trufflehog install failed — see https://github.com/trufflesecurity/trufflehog#floppy_disk-installation"
+fi
+# Real module path is zricethezav/gitleaks, NOT gitleaks/gitleaks — the import
+# path github.com/gitleaks/gitleaks/v8 does not exist.
+go_install gitleaks         github.com/zricethezav/gitleaks/v8
 go_install github-subdomains github.com/gwen001/github-subdomains
 go_install asnmap           github.com/projectdiscovery/asnmap/cmd/asnmap
 go_install subzy            github.com/PentestPad/subzy
@@ -140,7 +152,8 @@ go_install chaos            github.com/projectdiscovery/chaos-client/cmd/chaos
 
 # Active DNS bruteforce + permutation
 go_install puredns          github.com/d3mondev/puredns/v2
-go_install dnsgen           github.com/ProjectAnte/dnsgen
+# dnsgen is a Python tool, not a Go module — `go install` can never work for it.
+pip_install dnsgen dnsgen
 if have massdns; then
   ok "massdns already installed, skipping"
 else
@@ -164,7 +177,16 @@ else
   pip3 install --user --break-system-packages -e "$HOME/.tools/ParamSpider" >/dev/null 2>&1
   ok "paramspider installed"
 fi
-go_install kr github.com/assetnote/kiterunner/cmd/kr  # binary AND command are both 'kr', not 'kiterunner'
+# kiterunner has no working `go install` path (its module doesn't expose a
+# cmd/kr package) — the officially supported method is clone + make build.
+if have kr; then
+  ok "kr (kiterunner) already installed, skipping"
+else
+  log "Installing kr / kiterunner (git clone + make build)..."
+  git clone -q --depth 1 https://github.com/assetnote/kiterunner.git "$HOME/.tools/kiterunner" 2>/dev/null
+  ( cd "$HOME/.tools/kiterunner" && make build >/dev/null 2>&1 && cp dist/kr "$HOME/.local/bin/kr" 2>/dev/null )
+  have kr && ok "kr (kiterunner) installed" || warn "kr build failed — download a prebuilt binary instead from https://github.com/assetnote/kiterunner/releases"
+fi
 
 # JS endpoint/secret extraction
 pip_install linkfinder   linkfinder || true
@@ -244,11 +266,15 @@ fi
 echo ""
 ok "Full install pass complete."
 echo ""
-log "Make sure these are in your \$PATH:"
+echo -e "${YELLOW}⚠️  IMPORTANT: tools were installed to $GOBIN_DIR and ~/.local/bin,${NC}"
+echo -e "${YELLOW}   but your CURRENT shell doesn't know about that yet.${NC}"
+echo -e "${YELLOW}   Running recon.sh right now will still show tools as 'not installed'.${NC}"
+echo ""
+log "Run this in your current shell before using recon.sh:"
 echo "    export PATH=\"\$PATH:$GOBIN_DIR:\$HOME/.local/bin\""
 echo ""
-log "Add the line above to your ~/.bashrc or ~/.zshrc, then run:"
-echo "    source ~/.bashrc"
+log "To make it permanent, add that line to ~/.bashrc or ~/.zshrc, then either"
+log "run 'source ~/.bashrc' or open a new terminal."
 echo ""
 log "Verify everything is reachable with:"
 echo "    which subfinder dnsx httpx nuclei naabu katana gau ffuf subjs trufflehog gowitness amass dalfox arjun"
