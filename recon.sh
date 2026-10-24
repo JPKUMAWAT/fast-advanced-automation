@@ -453,8 +453,10 @@ if [ "$ASN_SCAN" = true ]; then
   log "Phase 8: ASN / IP range discovery"
   if have asnmap; then
     # asnmap needs a one-time ProjectDiscovery Cloud auth (run `asnmap -auth` once
-    # and log in) — without it this call will fail to return results.
-    asnmap -d "$DOMAIN" -silent -o asn/ranges.txt 2>>"$LOGFILE" || true
+    # and log in). Without it, asnmap prompts interactively for an API key and
+    # will hang the whole script waiting on stdin — redirect stdin from
+    # /dev/null so it fails fast instead of blocking.
+    asnmap -d "$DOMAIN" -silent -o asn/ranges.txt < /dev/null 2>>"$LOGFILE" || true
     ASN_COUNT=$(countf asn/ranges.txt)
     if [ "$ASN_COUNT" -eq 0 ]; then
       warn "ASN lookup returned nothing — run 'asnmap -auth' once to log in to ProjectDiscovery Cloud, then retry"
@@ -472,7 +474,15 @@ fi
 if [ "$PORTSCAN" = true ]; then
   log "Phase 9: Port scanning with naabu"
   if have naabu; then
-    naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE"
+    # naabu's default SYN scan needs raw-socket access (root). Running
+    # unprivileged silently returns 0 results with no error — use CONNECT
+    # scan instead, which works fine without root (slightly slower, but reliable).
+    if [ "$(id -u)" -eq 0 ]; then
+      naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+    else
+      warn "Not running as root — naabu would silently find 0 ports with its default SYN scan. Using -scan-type connect instead."
+      naabu -l "$RESOLVED_FILE" -scan-type connect -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+    fi
     ok "Open ports found: $(countf ports/open_ports.txt)"
   else
     warn "naabu not installed, skipping port scan"
@@ -488,7 +498,13 @@ log "Phase 10: HTTP(S) probing with $HTTPX_BIN"
 LIVE_COUNT=$(countf http/live_hosts.txt)
 ok "Live HTTP(S) hosts: $LIVE_COUNT"
 awk '{print $1}' http/live_hosts.txt > http/live_urls.txt
-[ -s http/live_urls.txt ] || { err "No live hosts found. Stopping."; exit 1; }
+if [ ! -s http/live_urls.txt ]; then
+  warn "No live HTTP(S) hosts found. This can be a transient network/WAF issue rather"
+  warn "than a real result — all subdomain/DNS work so far is still saved. Host-dependent"
+  warn "modules below will have nothing to scan and will show 0, but the run continues"
+  warn "so you get a summary instead of losing everything. Consider re-running if this"
+  warn "looks wrong (check logs/recon.log for connectivity errors from this run)."
+fi
 
 # ========================================================================
 # PHASE 11: Subdomain Takeover Check (optional)
