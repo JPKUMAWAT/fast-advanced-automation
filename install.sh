@@ -383,17 +383,32 @@ else
 fi
 echo ""
 
+# =========================================================================
+# FIX #7: persist PATH automatically instead of only printing instructions.
+# This is exactly the gap that caused "install.sh says 40/40 installed" in
+# one terminal run, immediately followed by "recon.sh says subfinder/
+# assetfinder/dnsx not installed" in a separate `bash recon.sh ...` run —
+# a child process's `export PATH=...` dies with it; it was never visible to
+# any other terminal or script invocation in the first place.
+# -------------------------------------------------------------------------
+RC_FILE="$HOME/.bashrc"
+case "${SHELL:-}" in *zsh*) RC_FILE="$HOME/.zshrc" ;; esac
+PATH_LINE="export PATH=\"\$PATH:$GOBIN_DIR:$LOCAL_BIN\""
+if [ -f "$RC_FILE" ] && grep -qF "$PATH_LINE" "$RC_FILE" 2>/dev/null; then
+  ok "$RC_FILE already has the PATH export — nothing to do."
+else
+  { echo ""; echo "# Added by recon toolkit install.sh"; echo "$PATH_LINE"; } >> "$RC_FILE"
+  ok "Added PATH export to $RC_FILE permanently."
+  warn "Still run 'source $RC_FILE' (or open a new terminal) before using recon.sh —"
+  warn "a shell that's ALREADY open, like this one, won't pick up an rc-file change on its own."
+fi
+
 if [ "$FULL" = false ]; then
   exit 0
 fi
 
 echo ""
 ok "Full install pass complete."
-echo ""
-echo -e "${YELLOW}PATH was updated for THIS script's run only.${NC}"
-log "To make it permanent for future shells, add this to ~/.bashrc or ~/.zshrc:"
-echo "    export PATH=\"\$PATH:$GOBIN_DIR:$LOCAL_BIN\""
-echo "then run 'source ~/.bashrc' (or open a new terminal)."
 echo ""
 log "Verify everything is reachable with:"
 echo "    which subfinder dnsx httpx nuclei naabu katana gau ffuf subjs trufflehog gowitness amass dalfox arjun"
