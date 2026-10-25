@@ -48,6 +48,34 @@
 
 set -uo pipefail
 
+# ---------- Cleanup on exit/interrupt ----------
+# Some tools we background with '&' (notably sublist3r, which forks its own
+# Python multiprocessing worker per search engine) spawn grandchild processes
+# that are NOT automatically killed when this script exits or is Ctrl-C'd.
+# Left running, they can bleed stray output, crashes, or even "[sudo] password
+# for kali:" prompts into a completely unrelated LATER terminal session. Track
+# every backgrounded PID and make sure the whole subtree is killed on exit.
+BG_PIDS=()
+# Recursively kill a process and everything it spawned (children, grandchildren,
+# ...) — needed because e.g. sublist3r forks its own Python multiprocessing
+# worker PER SEARCH ENGINE, which is a grandchild of the PID we captured, not
+# a direct child, so a single-level kill would miss it.
+killtree() {
+  local pid="$1" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    killtree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null
+}
+cleanup_background_jobs() {
+  local pid
+  for pid in "${BG_PIDS[@]:-}"; do
+    [ -z "$pid" ] && continue
+    killtree "$pid"
+  done
+}
+trap cleanup_background_jobs EXIT INT TERM
+
 # ---------- Defaults ----------
 THREADS=100
 OUTDIR=""
@@ -280,32 +308,37 @@ fi
 
 run_if_available() {
   local tool="$1"; shift
-  if have "$tool"; then "$@"; else warn "Skipping $tool (not installed)"; fi
+  # Redirect stdin from /dev/null: if this tool (or a library it depends on,
+  # e.g. a package quietly running `sudo something` on first use) ever tries
+  # to prompt interactively, it fails fast instead of silently hanging the
+  # whole script — this bit us once with asnmap and could happen with any tool.
+  if have "$tool"; then "$@" < /dev/null; else warn "Skipping $tool (not installed)"; fi
 }
 
 # ========================================================================
 # PHASE 1: Subdomain Enumeration (passive, parallel)
 # ========================================================================
 log "Phase 1: Subdomain enumeration"
-run_if_available subfinder subfinder -d "$DOMAIN" -all -recursive -t "$THREADS" -silent -o raw/subfinder.txt &
-run_if_available assetfinder bash -c "assetfinder -subs-only '$DOMAIN' > raw/assetfinder.txt" &
-run_if_available findomain findomain -t "$DOMAIN" -u raw/findomain.txt &
-run_if_available sublist3r sublist3r -d "$DOMAIN" -t 50 -o raw/sublist3r.txt &
-run_if_available subdominator bash -c "subdominator -d '$DOMAIN' > raw/subdominator.txt" &
+run_if_available subfinder subfinder -d "$DOMAIN" -all -recursive -t "$THREADS" -silent -o raw/subfinder.txt & BG_PIDS+=("$!")
+run_if_available assetfinder bash -c "assetfinder -subs-only '$DOMAIN' > raw/assetfinder.txt" & BG_PIDS+=("$!")
+run_if_available findomain findomain -t "$DOMAIN" -u raw/findomain.txt & BG_PIDS+=("$!")
+run_if_available sublist3r sublist3r -d "$DOMAIN" -t 50 -o raw/sublist3r.txt & BG_PIDS+=("$!")
+run_if_available subdominator bash -c "subdominator -d '$DOMAIN' > raw/subdominator.txt" & BG_PIDS+=("$!")
 if [ "$AMASS_SCAN" = true ]; then
-  run_if_available amass bash -c "amass enum -passive -d '$DOMAIN' -o raw/amass.txt" &
+  run_if_available amass bash -c "amass enum -passive -d '$DOMAIN' -o raw/amass.txt" & BG_PIDS+=("$!")
 fi
 if [ "$CHAOS_SCAN" = true ]; then
   if [ -z "${CHAOS_API_KEY:-}" ]; then
     warn "Skipping chaos (CHAOS_API_KEY env var not set — get one free at chaos.projectdiscovery.io)"
   else
-    run_if_available chaos bash -c "chaos -d '$DOMAIN' -key '$CHAOS_API_KEY' -silent -o raw/chaos.txt" &
+    run_if_available chaos bash -c "chaos -d '$DOMAIN' -key '$CHAOS_API_KEY' -silent -o raw/chaos.txt" & BG_PIDS+=("$!")
   fi
 fi
 if [ "$GITHUB_SCAN" = true ]; then
-  run_if_available github-subdomains bash -c "github-subdomains -d '$DOMAIN' -raw > raw/github_subs.txt" &
+  run_if_available github-subdomains bash -c "github-subdomains -d '$DOMAIN' -raw > raw/github_subs.txt" & BG_PIDS+=("$!")
 fi
 wait
+BG_PIDS=()   # all finished cleanly — nothing left for the exit trap to chase
 ok "Subdomain enumeration complete"
 
 # ========================================================================
@@ -821,6 +854,21 @@ nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -si
   -o vulns/nuclei_results.txt -je vulns/nuclei_results.json
 FINDINGS=$(countf vulns/nuclei_results.txt)
 ok "Nuclei findings: $FINDINGS"
+
+# ========================================================================
+# CLEANUP: Remove empty output folders
+# ========================================================================
+# mkdir -p creates every module's folder upfront regardless of which modules
+# actually ran, so unused ones (e.g. sqli/ when --sqli was never passed) are
+# left behind empty. Clean those up now that every phase has finished writing.
+log "Cleaning up empty output folders"
+EMPTIED=0
+for i in 1 2; do
+  while IFS= read -r d; do
+    rmdir "$d" 2>/dev/null && EMPTIED=$((EMPTIED + 1))
+  done < <(find . -mindepth 1 -type d -empty 2>/dev/null)
+done
+[ "$EMPTIED" -gt 0 ] && ok "Removed $EMPTIED empty folder(s)" || ok "No empty folders to remove"
 
 # ========================================================================
 # PHASE 27: Summary Report
