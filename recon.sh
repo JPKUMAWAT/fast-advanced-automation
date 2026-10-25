@@ -106,6 +106,14 @@ SQLI_LEVEL=1
 # running those loops at THREADS=100 in parallel against one target's hosts
 # is what causes rate-limit bans / API blocks, so this defaults much lower.
 LOOP_CONCURRENCY=10
+# How long any single Phase 1 enumeration tool (subfinder, sublist3r, etc.) is
+# allowed to run before being killed. Phase 1 backgrounds several tools and
+# then does a plain `wait` for all of them — with no timeout, one engine
+# stuck on a slow/unreachable host (common on restricted networks, VPNs, or
+# when an upstream API like crt.sh/DNSdumpster is down) blocks that `wait`
+# indefinitely and the whole script looks frozen, even though every other
+# tool already finished.
+ENUM_TIMEOUT=240
 
 # ---------- Colors ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -159,6 +167,10 @@ Core options:
   -r,  --rate-limit <n>      Nuclei rate limit, req/sec (default: 150)
   -c,  --concurrency <n>     Parallel jobs for per-host loops: Shodan, wafw00f,
                               arjun, linkfinder, secretfinder (default: 10)
+  --enum-timeout <seconds>   Max time per Phase 1 enum tool before it's killed
+                              (default: 240) — stops one stuck engine (e.g. a
+                              sublist3r search provider hanging on a slow/
+                              unreachable host) from freezing the whole run
   --sev <list>                Nuclei severities (default: critical,high,medium,low)
 
 Module toggles (each skips gracefully if its tool isn't installed):
@@ -219,6 +231,7 @@ while [ $# -gt 0 ]; do
     -t|--threads) THREADS="$2"; shift 2 ;;
     -r|--rate-limit) NUCLEI_RATE_LIMIT="$2"; shift 2 ;;
     -c|--concurrency) LOOP_CONCURRENCY="$2"; shift 2 ;;
+    --enum-timeout) ENUM_TIMEOUT="$2"; shift 2 ;;
     --sev) SEVERITIES="$2"; shift 2 ;;
     --full) FULL=true; shift ;;
     --amass) AMASS_SCAN=true; shift ;;
@@ -332,7 +345,23 @@ fi
 
 run_if_available() {
   local tool="$1"; shift
-  if have "$tool"; then "$@" < /dev/null; else warn "Skipping $tool (not installed)"; fi
+  if ! have "$tool"; then
+    warn "Skipping $tool (not installed)"
+    return 0
+  fi
+  # `timeout` kills the whole command (and whatever it execs into) after
+  # $ENUM_TIMEOUT seconds. Without this, a single hung engine inside e.g.
+  # sublist3r (which has no global timeout of its own) blocks Phase 1's
+  # `wait` forever — every other tool can finish in seconds and the script
+  # still looks "stuck" because it's waiting on that one PID. Exit code 124
+  # is `timeout`'s specific signal for "I killed it", so we only warn in
+  # that case rather than on every normal non-zero exit.
+  timeout "$ENUM_TIMEOUT" "$@" < /dev/null
+  local rc=$?
+  if [ "$rc" -eq 124 ]; then
+    warn "$tool timed out after ${ENUM_TIMEOUT}s — killed, continuing with results from other tools (raise with --enum-timeout if this target is just slow)"
+  fi
+  return 0
 }
 
 # ========================================================================
