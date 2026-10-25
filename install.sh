@@ -25,6 +25,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 GOBIN_DIR="${GOBIN:-$(go env GOPATH 2>/dev/null)/bin}"
 [ -z "$GOBIN_DIR" ] && GOBIN_DIR="$HOME/go/bin"
+LOCAL_BIN="$HOME/.local/bin"
+TOOLS_DIR="$HOME/.tools"
+
+# ---------- FIX #1 + #2: create dirs and export PATH BEFORE anything installs ----------
+# Without this, every wrapper script written to ~/.local/bin below is invisible
+# to `have()` checks later in THIS SAME run (a freshly installed tool would be
+# reported as "not installed" by the very next step that depends on it), and
+# redirects into ~/.local/bin silently fail if the directory doesn't exist yet.
+mkdir -p "$LOCAL_BIN" "$TOOLS_DIR" "$GOBIN_DIR"
+export PATH="$PATH:$GOBIN_DIR:$LOCAL_BIN"
+
+# ---------- Track failures for the end-of-run summary ----------
+INSTALLED=()
+FAILED=()
 
 # ---------- Pre-flight checks ----------
 log "Checking prerequisites..."
@@ -33,25 +47,36 @@ have go     || MISSING_PREREQ+=("go (https://go.dev/doc/install)")
 have python3 || MISSING_PREREQ+=("python3")
 have pip3   || MISSING_PREREQ+=("pip3")
 have git    || MISSING_PREREQ+=("git")
+have unzip  || MISSING_PREREQ+=("unzip (needed for findomain's release .zip)")
 
 if [ "${#MISSING_PREREQ[@]}" -gt 0 ]; then
   err "Missing prerequisites, install these first:"
   for p in "${MISSING_PREREQ[@]}"; do echo "    - $p"; done
   exit 1
 fi
-ok "Prerequisites OK (go, python3, pip3, git found)"
-log "Go tools will install to: $GOBIN_DIR  (make sure this is in your \$PATH)"
+ok "Prerequisites OK (go, python3, pip3, git, unzip found)"
+log "Go tools install to: $GOBIN_DIR | wrapper/script tools install to: $LOCAL_BIN"
+log "Both are now on PATH for the rest of this run."
 
 go_install() {
   local name="$1" pkg="$2"
   if have "$name"; then
     ok "$name already installed, skipping"
+    INSTALLED+=("$name")
   else
     log "Installing $name..."
     if go install -v "$pkg@latest" 2>&1 | tail -5; then
-      ok "$name installed"
+      hash -r   # refresh bash's command lookup cache for this session
+      if have "$name"; then
+        ok "$name installed"
+        INSTALLED+=("$name")
+      else
+        warn "$name: go install reported success but binary not found on PATH (check GOBIN_DIR name vs expected binary name)"
+        FAILED+=("$name")
+      fi
     else
       warn "$name failed to install, check the log above"
+      FAILED+=("$name")
     fi
   fi
 }
@@ -60,11 +85,19 @@ pip_install() {
   local name="$1" pkg="$2"
   if have "$name"; then
     ok "$name already installed, skipping"
+    INSTALLED+=("$name")
   else
     log "Installing $name via pip..."
     pip3 install --user --break-system-packages "$pkg" >/dev/null 2>&1 \
       || pip3 install --user "$pkg" >/dev/null 2>&1
-    have "$name" && ok "$name installed" || warn "$name install may need manual PATH setup"
+    hash -r
+    if have "$name"; then
+      ok "$name installed"
+      INSTALLED+=("$name")
+    else
+      warn "$name install may need manual PATH setup"
+      FAILED+=("$name")
+    fi
   fi
 }
 
@@ -81,26 +114,41 @@ go_install nuclei       github.com/projectdiscovery/nuclei/v3/cmd/nuclei
 # findomain ships as a prebuilt binary release, not go-installable
 if have findomain; then
   ok "findomain already installed, skipping"
+  INSTALLED+=("findomain")
 else
   log "Installing findomain (prebuilt binary)..."
-  curl -sL https://github.com/findomain/findomain/releases/latest/download/findomain-linux.zip -o /tmp/findomain.zip \
-    && unzip -o -q /tmp/findomain.zip -d /tmp \
-    && chmod +x /tmp/findomain \
-    && sudo mv /tmp/findomain /usr/local/bin/findomain 2>/dev/null \
-    || mv /tmp/findomain "$HOME/.local/bin/findomain" 2>/dev/null
-  have findomain && ok "findomain installed" || warn "findomain install failed — install manually from https://github.com/findomain/findomain/releases"
+  if curl -sL https://github.com/findomain/findomain/releases/latest/download/findomain-linux.zip -o /tmp/findomain.zip \
+      && unzip -o -q /tmp/findomain.zip -d /tmp \
+      && chmod +x /tmp/findomain; then
+    # FIX #3: install straight to ~/.local/bin (already ours to write, already
+    # on PATH). Only try sudo as a non-interactive, non-blocking fallback —
+    # `sudo -n` fails immediately instead of hanging on a password prompt.
+    if mv /tmp/findomain "$LOCAL_BIN/findomain" 2>/dev/null; then
+      :
+    elif sudo -n mv /tmp/findomain /usr/local/bin/findomain 2>/dev/null; then
+      :
+    else
+      warn "Could not place findomain binary (no write access to $LOCAL_BIN and no passwordless sudo)"
+    fi
+  fi
+  hash -r
+  if have findomain; then ok "findomain installed"; INSTALLED+=("findomain")
+  else warn "findomain install failed — install manually from https://github.com/findomain/findomain/releases"; FAILED+=("findomain"); fi
 fi
 
 # sublist3r — python tool, no pip package, clone + run as module
 if have sublist3r; then
   ok "sublist3r already installed, skipping"
+  INSTALLED+=("sublist3r")
 else
   log "Installing sublist3r (git clone)..."
-  git clone -q https://github.com/aboul3la/Sublist3r.git "$HOME/.tools/Sublist3r" 2>/dev/null
-  pip3 install --user --break-system-packages -r "$HOME/.tools/Sublist3r/requirements.txt" >/dev/null 2>&1
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/Sublist3r/sublist3r.py "$@"\n' "$HOME" > "$HOME/.local/bin/sublist3r" 2>/dev/null
-  chmod +x "$HOME/.local/bin/sublist3r" 2>/dev/null
-  ok "sublist3r installed (wrapper in ~/.local/bin)"
+  git clone -q https://github.com/aboul3la/Sublist3r.git "$TOOLS_DIR/Sublist3r" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$TOOLS_DIR/Sublist3r/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/Sublist3r/sublist3r.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/sublist3r"
+  chmod +x "$LOCAL_BIN/sublist3r"
+  hash -r
+  if have sublist3r; then ok "sublist3r installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("sublist3r")
+  else warn "sublist3r wrapper not found on PATH"; FAILED+=("sublist3r"); fi
 fi
 
 # subdominator — pip-installable
@@ -112,12 +160,12 @@ if [ "$FULL" = false ]; then
   echo ""
   log "Core tools done. Run with --full to also install optional module tools:"
   echo "    ./install.sh --full"
-  exit 0
 fi
 
 # =========================================================================
 # OPTIONAL (per module in recon.sh --full)
 # =========================================================================
+if [ "$FULL" = true ]; then
 log "=== Installing optional module tools ==="
 
 go_install naabu            github.com/projectdiscovery/naabu/v2/cmd/naabu
@@ -127,15 +175,17 @@ go_install waybackurls      github.com/tomnomnom/waybackurls
 go_install ffuf             github.com/ffuf/ffuf/v2
 go_install subjs            github.com/lc/subjs
 if have trufflehog; then
-  ok "trufflehog already installed, skipping"
+  ok "trufflehog already installed, skipping"; INSTALLED+=("trufflehog")
 else
   # trufflehog's own go.mod uses replace directives, so `go install` always
   # fails with "must not contain directives..." — their official installer
   # script is the only reliable method.
   log "Installing trufflehog (official install script)..."
   curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-    | sh -s -- -b "$HOME/.local/bin" >/dev/null 2>&1
-  have trufflehog && ok "trufflehog installed" || warn "trufflehog install failed — see https://github.com/trufflesecurity/trufflehog#floppy_disk-installation"
+    | sh -s -- -b "$LOCAL_BIN" >/dev/null 2>&1
+  hash -r
+  if have trufflehog; then ok "trufflehog installed"; INSTALLED+=("trufflehog")
+  else warn "trufflehog install failed — see https://github.com/trufflesecurity/trufflehog#floppy_disk-installation"; FAILED+=("trufflehog"); fi
 fi
 # Real module path is zricethezav/gitleaks, NOT gitleaks/gitleaks — the import
 # path github.com/gitleaks/gitleaks/v8 does not exist.
@@ -155,12 +205,14 @@ go_install puredns          github.com/d3mondev/puredns/v2
 # dnsgen is a Python tool, not a Go module — `go install` can never work for it.
 pip_install dnsgen dnsgen
 if have massdns; then
-  ok "massdns already installed, skipping"
+  ok "massdns already installed, skipping"; INSTALLED+=("massdns")
 else
   log "Installing massdns (build from source)..."
-  git clone -q https://github.com/blechschmidt/massdns.git "$HOME/.tools/massdns" 2>/dev/null
-  (cd "$HOME/.tools/massdns" && make >/dev/null 2>&1 && cp bin/massdns "$HOME/.local/bin/massdns" 2>/dev/null)
-  have massdns && ok "massdns installed" || warn "massdns build failed — build manually from https://github.com/blechschmidt/massdns"
+  git clone -q https://github.com/blechschmidt/massdns.git "$TOOLS_DIR/massdns" 2>/dev/null
+  (cd "$TOOLS_DIR/massdns" && make >/dev/null 2>&1 && cp bin/massdns "$LOCAL_BIN/massdns" 2>/dev/null)
+  hash -r
+  if have massdns; then ok "massdns installed"; INSTALLED+=("massdns")
+  else warn "massdns build failed — build manually from https://github.com/blechschmidt/massdns"; FAILED+=("massdns"); fi
 fi
 
 # Alternate crawlers
@@ -170,83 +222,135 @@ go_install hakrawler        github.com/hakluke/hakrawler
 # Hidden parameter discovery + API route bruteforce
 pip_install arjun arjun
 if have paramspider; then
-  ok "paramspider already installed, skipping"
+  ok "paramspider already installed, skipping"; INSTALLED+=("paramspider")
 else
   log "Installing paramspider (git clone)..."
-  git clone -q https://github.com/devanshbatham/ParamSpider.git "$HOME/.tools/ParamSpider" 2>/dev/null
-  pip3 install --user --break-system-packages -e "$HOME/.tools/ParamSpider" >/dev/null 2>&1
-  ok "paramspider installed"
+  git clone -q https://github.com/devanshbatham/ParamSpider.git "$TOOLS_DIR/ParamSpider" 2>/dev/null
+  pip3 install --user --break-system-packages -e "$TOOLS_DIR/ParamSpider" >/dev/null 2>&1
+  hash -r
+  if have paramspider; then ok "paramspider installed"; INSTALLED+=("paramspider")
+  else warn "paramspider install may need manual PATH setup"; FAILED+=("paramspider"); fi
 fi
 # kiterunner has no working `go install` path (its module doesn't expose a
 # cmd/kr package) — the officially supported method is clone + make build.
 if have kr; then
-  ok "kr (kiterunner) already installed, skipping"
+  ok "kr (kiterunner) already installed, skipping"; INSTALLED+=("kr")
 else
   log "Installing kr / kiterunner (git clone + make build)..."
-  git clone -q --depth 1 https://github.com/assetnote/kiterunner.git "$HOME/.tools/kiterunner" 2>/dev/null
-  ( cd "$HOME/.tools/kiterunner" && make build >/dev/null 2>&1 && cp dist/kr "$HOME/.local/bin/kr" 2>/dev/null )
-  have kr && ok "kr (kiterunner) installed" || warn "kr build failed — download a prebuilt binary instead from https://github.com/assetnote/kiterunner/releases"
+  git clone -q --depth 1 https://github.com/assetnote/kiterunner.git "$TOOLS_DIR/kiterunner" 2>/dev/null
+  ( cd "$TOOLS_DIR/kiterunner" && make build >/dev/null 2>&1 && cp dist/kr "$LOCAL_BIN/kr" 2>/dev/null )
+  hash -r
+  if have kr; then ok "kr (kiterunner) installed"; INSTALLED+=("kr")
+  else warn "kr build failed — download a prebuilt binary instead from https://github.com/assetnote/kiterunner/releases"; FAILED+=("kr"); fi
 fi
 
 # JS endpoint/secret extraction
-pip_install linkfinder   linkfinder || true
-if [ ! -d "$HOME/.tools/LinkFinder" ]; then
+# FIX #4: no PyPI package named "linkfinder" exists — the git-clone wrapper
+# below is the only real install path, so the bogus pip_install call that
+# used to precede it (which always failed and printed a confusing warning)
+# has been removed.
+if [ ! -d "$TOOLS_DIR/LinkFinder" ]; then
   log "Installing LinkFinder (git clone)..."
-  git clone -q https://github.com/GerbenJavado/LinkFinder.git "$HOME/.tools/LinkFinder" 2>/dev/null
-  pip3 install --user --break-system-packages -r "$HOME/.tools/LinkFinder/requirements.txt" >/dev/null 2>&1
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/LinkFinder/linkfinder.py "$@"\n' "$HOME" > "$HOME/.local/bin/linkfinder" 2>/dev/null
-  chmod +x "$HOME/.local/bin/linkfinder" 2>/dev/null
-  ok "LinkFinder installed (wrapper in ~/.local/bin)"
+  git clone -q https://github.com/GerbenJavado/LinkFinder.git "$TOOLS_DIR/LinkFinder" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$TOOLS_DIR/LinkFinder/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/LinkFinder/linkfinder.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/linkfinder"
+  chmod +x "$LOCAL_BIN/linkfinder"
+  hash -r
+  if have linkfinder; then ok "LinkFinder installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("linkfinder")
+  else warn "LinkFinder wrapper not found on PATH"; FAILED+=("linkfinder"); fi
+else
+  ok "LinkFinder already installed, skipping"; INSTALLED+=("linkfinder")
 fi
-if [ ! -d "$HOME/.tools/SecretFinder" ]; then
+if [ ! -d "$TOOLS_DIR/SecretFinder" ]; then
   log "Installing SecretFinder (git clone)..."
-  git clone -q https://github.com/m4ll0k/SecretFinder.git "$HOME/.tools/SecretFinder" 2>/dev/null
-  pip3 install --user --break-system-packages -r "$HOME/.tools/SecretFinder/requirements.txt" >/dev/null 2>&1
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/SecretFinder/SecretFinder.py "$@"\n' "$HOME" > "$HOME/.local/bin/secretfinder" 2>/dev/null
-  chmod +x "$HOME/.local/bin/secretfinder" 2>/dev/null
-  ok "SecretFinder installed (wrapper in ~/.local/bin)"
+  git clone -q https://github.com/m4ll0k/SecretFinder.git "$TOOLS_DIR/SecretFinder" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$TOOLS_DIR/SecretFinder/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/SecretFinder/SecretFinder.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/secretfinder"
+  chmod +x "$LOCAL_BIN/secretfinder"
+  hash -r
+  if have secretfinder; then ok "SecretFinder installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("secretfinder")
+  else warn "SecretFinder wrapper not found on PATH"; FAILED+=("secretfinder"); fi
+else
+  ok "SecretFinder already installed, skipping"; INSTALLED+=("secretfinder")
 fi
 
 # XSS + SQLi (opt-in, detection-focused)
 go_install dalfox github.com/hahwul/dalfox/v2
 if have sqlmap; then
-  ok "sqlmap already installed, skipping"
+  ok "sqlmap already installed, skipping"; INSTALLED+=("sqlmap")
 else
   log "Installing sqlmap (git clone)..."
-  git clone -q --depth 1 https://github.com/sqlmapproject/sqlmap.git "$HOME/.tools/sqlmap" 2>/dev/null
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/sqlmap/sqlmap.py "$@"\n' "$HOME" > "$HOME/.local/bin/sqlmap" 2>/dev/null
-  chmod +x "$HOME/.local/bin/sqlmap" 2>/dev/null
-  ok "sqlmap installed (wrapper in ~/.local/bin) — use --sqli only with explicit program authorization"
+  git clone -q --depth 1 https://github.com/sqlmapproject/sqlmap.git "$TOOLS_DIR/sqlmap" 2>/dev/null
+  printf '#!/usr/bin/env bash\npython3 %s/sqlmap/sqlmap.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/sqlmap"
+  chmod +x "$LOCAL_BIN/sqlmap"
+  hash -r
+  if have sqlmap; then ok "sqlmap installed (wrapper in $LOCAL_BIN) — use --sqli only with explicit program authorization"; INSTALLED+=("sqlmap")
+  else warn "sqlmap wrapper not found on PATH"; FAILED+=("sqlmap"); fi
 fi
 
 pip_install wafw00f wafw00f
-pip_install cloud_enum cloudenum
 
-# S3Scanner — go-installable; the actual binary name is lowercase 's3scanner'
-go_install s3scanner github.com/sa7mon/s3scanner
+# FIX #4 (cont'd): "cloudenum" is not a reliable/real PyPI package for this
+# tool — install the same way as the other git-only tools above instead.
+if have cloud_enum; then
+  ok "cloud_enum already installed, skipping"; INSTALLED+=("cloud_enum")
+else
+  log "Installing cloud_enum (git clone)..."
+  git clone -q https://github.com/initstring/cloud_enum.git "$TOOLS_DIR/cloud_enum" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$TOOLS_DIR/cloud_enum/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/cloud_enum/cloud_enum.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/cloud_enum"
+  chmod +x "$LOCAL_BIN/cloud_enum"
+  hash -r
+  if have cloud_enum; then ok "cloud_enum installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("cloud_enum")
+  else warn "cloud_enum wrapper not found on PATH"; FAILED+=("cloud_enum"); fi
+fi
+
+# FIX #5: the real repo/binary is "S3Scanner" (capital S, capital S) — `go
+# install` names the binary after the import path verbatim, so a plain
+# go_install here produces a binary your script can never find under the
+# lowercase name it checks for. Install it, then add a lowercase symlink so
+# recon.sh's `have s3scanner` check actually works.
+if have s3scanner; then
+  ok "s3scanner already installed, skipping"; INSTALLED+=("s3scanner")
+else
+  log "Installing s3scanner (as S3Scanner)..."
+  if go install -v github.com/sa7mon/S3Scanner@latest 2>&1 | tail -5; then
+    hash -r
+    if have S3Scanner; then
+      ln -sf "$(command -v S3Scanner)" "$LOCAL_BIN/s3scanner"
+      hash -r
+    fi
+  fi
+  if have s3scanner; then ok "s3scanner installed (symlinked to S3Scanner)"; INSTALLED+=("s3scanner")
+  else warn "s3scanner failed to install"; FAILED+=("s3scanner"); fi
+fi
 
 # Corsy — git clone, python script
-if have corsy || [ -d "$HOME/.tools/Corsy" ]; then
-  ok "Corsy already installed, skipping"
+if have corsy; then
+  ok "Corsy already installed, skipping"; INSTALLED+=("corsy")
 else
   log "Installing Corsy (git clone)..."
-  git clone -q https://github.com/s0md3v/Corsy.git "$HOME/.tools/Corsy" 2>/dev/null
-  pip3 install --user --break-system-packages -r "$HOME/.tools/Corsy/requirements.txt" >/dev/null 2>&1
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/Corsy/corsy.py "$@"\n' "$HOME" > "$HOME/.local/bin/corsy" 2>/dev/null
-  chmod +x "$HOME/.local/bin/corsy" 2>/dev/null
-  ok "Corsy installed (wrapper in ~/.local/bin)"
+  git clone -q https://github.com/s0md3v/Corsy.git "$TOOLS_DIR/Corsy" 2>/dev/null
+  pip3 install --user --break-system-packages -r "$TOOLS_DIR/Corsy/requirements.txt" >/dev/null 2>&1
+  printf '#!/usr/bin/env bash\npython3 %s/Corsy/corsy.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/corsy"
+  chmod +x "$LOCAL_BIN/corsy"
+  hash -r
+  if have corsy; then ok "Corsy installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("corsy")
+  else warn "Corsy wrapper not found on PATH"; FAILED+=("corsy"); fi
 fi
 
 # favfreak — git clone, python script
-if have favfreak || [ -d "$HOME/.tools/FavFreak" ]; then
-  ok "favfreak already installed, skipping"
+if have favfreak; then
+  ok "favfreak already installed, skipping"; INSTALLED+=("favfreak")
 else
   log "Installing favfreak (git clone)..."
-  git clone -q https://github.com/devanshbatham/FavFreak.git "$HOME/.tools/FavFreak" 2>/dev/null
+  git clone -q https://github.com/devanshbatham/FavFreak.git "$TOOLS_DIR/FavFreak" 2>/dev/null
   pip3 install --user --break-system-packages mmh3 requests >/dev/null 2>&1
-  printf '#!/usr/bin/env bash\npython3 %s/.tools/FavFreak/favfreak.py "$@"\n' "$HOME" > "$HOME/.local/bin/favfreak" 2>/dev/null
-  chmod +x "$HOME/.local/bin/favfreak" 2>/dev/null
-  ok "favfreak installed (wrapper in ~/.local/bin)"
+  printf '#!/usr/bin/env bash\npython3 %s/FavFreak/favfreak.py "$@"\n' "$TOOLS_DIR" > "$LOCAL_BIN/favfreak"
+  chmod +x "$LOCAL_BIN/favfreak"
+  hash -r
+  if have favfreak; then ok "favfreak installed (wrapper in $LOCAL_BIN)"; INSTALLED+=("favfreak")
+  else warn "favfreak wrapper not found on PATH"; FAILED+=("favfreak"); fi
 fi
 
 # nuclei templates (needed for -tags takeover etc.)
@@ -261,20 +365,35 @@ if ! have dig; then
   warn "dig not found (needed for --shodan). Install it with:"
   echo "    sudo apt install dnsutils      # Debian/Ubuntu/Kali"
   echo "    sudo yum install bind-utils    # RHEL/CentOS"
+  FAILED+=("dig")
+fi
+
+fi # end FULL block
+
+# =========================================================================
+# FIX #6: end-of-run summary — one glanceable table instead of scrollback
+# =========================================================================
+echo ""
+log "=== Install summary ==="
+ok "Installed/available (${#INSTALLED[@]}): ${INSTALLED[*]:-none}"
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  err "Failed/missing (${#FAILED[@]}): ${FAILED[*]}"
+else
+  ok "Nothing failed."
+fi
+echo ""
+
+if [ "$FULL" = false ]; then
+  exit 0
 fi
 
 echo ""
 ok "Full install pass complete."
 echo ""
-echo -e "${YELLOW}⚠️  IMPORTANT: tools were installed to $GOBIN_DIR and ~/.local/bin,${NC}"
-echo -e "${YELLOW}   but your CURRENT shell doesn't know about that yet.${NC}"
-echo -e "${YELLOW}   Running recon.sh right now will still show tools as 'not installed'.${NC}"
-echo ""
-log "Run this in your current shell before using recon.sh:"
-echo "    export PATH=\"\$PATH:$GOBIN_DIR:\$HOME/.local/bin\""
-echo ""
-log "To make it permanent, add that line to ~/.bashrc or ~/.zshrc, then either"
-log "run 'source ~/.bashrc' or open a new terminal."
+echo -e "${YELLOW}PATH was updated for THIS script's run only.${NC}"
+log "To make it permanent for future shells, add this to ~/.bashrc or ~/.zshrc:"
+echo "    export PATH=\"\$PATH:$GOBIN_DIR:$LOCAL_BIN\""
+echo "then run 'source ~/.bashrc' (or open a new terminal)."
 echo ""
 log "Verify everything is reachable with:"
 echo "    which subfinder dnsx httpx nuclei naabu katana gau ffuf subjs trufflehog gowitness amass dalfox arjun"
