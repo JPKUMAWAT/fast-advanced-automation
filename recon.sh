@@ -63,6 +63,21 @@ cleanup_background_jobs() {
     [ -z "$pid" ] && continue
     killtree "$pid"
   done
+  # Phase 1's heartbeat logger (an infinite loop) isn't in BG_PIDS — waiting
+  # on it there would hang forever — so it's cleaned up separately here,
+  # covering both normal completion and an early Ctrl-C mid-Phase-1.
+  [ -n "${HEARTBEAT_PID:-}" ] && killtree "$HEARTBEAT_PID"
+  # Best-effort flush of any keystrokes typed into this terminal while the
+  # script was busy (every subprocess this script launches reads from
+  # /dev/null, not the terminal, so typed input is never consumed — it just
+  # sits queued at the TTY driver). Without draining it here, that queued
+  # input gets delivered to the PARENT shell the instant this script exits,
+  # which silently replays it as real commands. This is almost certainly
+  # what caused a stray `sudo ...` command to actually execute in an earlier
+  # run after someone typed into the terminal thinking it had frozen.
+  if [ -t 0 ]; then
+    while read -r -t 0.2 -n 10000 _ 2>/dev/null; do :; done
+  fi
 }
 trap cleanup_background_jobs EXIT INT TERM
 
@@ -389,9 +404,33 @@ if [ "$CHAOS_SCAN" = true ]; then
   fi
 fi
 if [ "$GITHUB_SCAN" = true ]; then
-  run_if_available github-subdomains bash -c "github-subdomains -d '$DOMAIN' -raw > raw/github_subs.txt" & BG_PIDS+=("$!")
+  if [ -z "${GITHUB_TOKEN:-}" ]; then
+    warn "Skipping github-subdomains (GITHUB_TOKEN env var not set — needs a GitHub personal access token; see github-subdomains --help)"
+  else
+    run_if_available github-subdomains bash -c "github-subdomains -d '$DOMAIN' -t '$GITHUB_TOKEN' -raw > raw/github_subs.txt" & BG_PIDS+=("$!")
+  fi
 fi
-wait
+# Heartbeat: sublist3r + subdominator can easily run 1-2+ minutes with zero
+# output in between. With nothing visibly happening, it's natural to assume
+# the terminal is frozen and start typing into it to check — but any
+# keystrokes typed while this script holds the terminal just sit queued at
+# the TTY driver and get delivered to the PARENT shell the moment this
+# script exits, which can replay as a real command (this is almost certainly
+# what caused an actual `sudo ...` command to fire on its own in an earlier
+# run). This heartbeat exists so there's always visible proof the script is
+# still alive, so there's never a reason to type and find out.
+(
+  elapsed=0
+  while true; do
+    sleep 15
+    elapsed=$((elapsed + 15))
+    log "Phase 1 still running (${elapsed}s elapsed, enum-timeout is ${ENUM_TIMEOUT}s/tool) — please don't type into this terminal while it's busy"
+  done
+) & HEARTBEAT_PID=$!
+
+wait "${BG_PIDS[@]}"
+kill "$HEARTBEAT_PID" 2>/dev/null
+wait "$HEARTBEAT_PID" 2>/dev/null
 BG_PIDS=()   # all finished cleanly — nothing left for the exit trap to chase
 ok "Subdomain enumeration complete"
 
