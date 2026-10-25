@@ -30,7 +30,7 @@
 #   Corsy              - CORS misconfiguration scanning
 #   wafw00f            - WAF/CDN fingerprinting
 #   asnmap             - ASN / IP range discovery
-#   favfreak           - favicon-hash tech fingerprinting
+#   favfreak            - favicon-hash tech fingerprinting
 #   arjun, paramspider  - hidden parameter discovery
 #   kiterunner          - API route/endpoint bruteforce
 #   dalfox              - XSS scanning
@@ -49,17 +49,7 @@
 set -uo pipefail
 
 # ---------- Cleanup on exit/interrupt ----------
-# Some tools we background with '&' (notably sublist3r, which forks its own
-# Python multiprocessing worker per search engine) spawn grandchild processes
-# that are NOT automatically killed when this script exits or is Ctrl-C'd.
-# Left running, they can bleed stray output, crashes, or even "[sudo] password
-# for kali:" prompts into a completely unrelated LATER terminal session. Track
-# every backgrounded PID and make sure the whole subtree is killed on exit.
 BG_PIDS=()
-# Recursively kill a process and everything it spawned (children, grandchildren,
-# ...) — needed because e.g. sublist3r forks its own Python multiprocessing
-# worker PER SEARCH ENGINE, which is a grandchild of the PID we captured, not
-# a direct child, so a single-level kill would miss it.
 killtree() {
   local pid="$1" child
   for child in $(pgrep -P "$pid" 2>/dev/null); do
@@ -110,6 +100,12 @@ XSS_SCAN=false
 SQLI_SCAN=false
 SQLI_RISK=1
 SQLI_LEVEL=1
+# Concurrency for this script's OWN per-host while-loops (Shodan, wafw00f,
+# arjun, linkfinder, secretfinder). Deliberately separate from THREADS, which
+# is passed to tools that already manage their own internal concurrency —
+# running those loops at THREADS=100 in parallel against one target's hosts
+# is what causes rate-limit bans / API blocks, so this defaults much lower.
+LOOP_CONCURRENCY=10
 
 # ---------- Colors ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -120,6 +116,32 @@ warn()  { echo -e "${YELLOW}[!]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "
 err()   { echo -e "${RED}[-]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOGFILE" >&2; }
 have()  { command -v "$1" >/dev/null 2>&1; }
 countf() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
+
+# run_parallel <input_file> <label>
+# Reads stdin from input_file and feeds each line into `xargs -P
+# $LOOP_CONCURRENCY -I{}`, running the rest of the arguments as the command
+# template (use {} where the line should be substituted). Logs start/end
+# with item counts so long batches never look frozen. This replaces the old
+# pattern — a bare `while read` loop, one item at a time, often with a fixed
+# `sleep`, no timeout — which is what made Phase 7 look hung against 3000+
+# hosts: serial + sleep 0.3s/host + no per-host timeout on dig/curl.
+# run_parallel <input_file> <label> <bash_command_string using $1 for the item>
+# $1 is the current line, so the string must use $1 (not {}); wrapping in
+# bash -c means things like redirection (>>) and pipes inside the command
+# string work correctly, unlike a bare `xargs -I{} cmd {}` which cannot
+# redirect — xargs would otherwise pass '>>' as a literal argument to cmd.
+run_parallel() {
+  local input_file="$1" label="$2" cmd="$3"
+  local total
+  total=$(countf "$input_file")
+  if [ "$total" -eq 0 ]; then
+    warn "$label: no input items, skipping"
+    return 0
+  fi
+  log "$label: processing $total item(s) at concurrency $LOOP_CONCURRENCY"
+  xargs -a "$input_file" -P "$LOOP_CONCURRENCY" -I{} bash -c "$cmd" _ {} 2>>"$LOGFILE"
+  ok "$label: done"
+}
 
 usage() {
   cat <<EOF
@@ -135,6 +157,8 @@ Core options:
   -o,  --outdir <dir>        Output directory (default: ./<domain>_<timestamp>)
   -t,  --threads <n>         Thread count (default: 100)
   -r,  --rate-limit <n>      Nuclei rate limit, req/sec (default: 150)
+  -c,  --concurrency <n>     Parallel jobs for per-host loops: Shodan, wafw00f,
+                              arjun, linkfinder, secretfinder (default: 10)
   --sev <list>                Nuclei severities (default: critical,high,medium,low)
 
 Module toggles (each skips gracefully if its tool isn't installed):
@@ -194,6 +218,7 @@ while [ $# -gt 0 ]; do
     -o|--outdir) OUTDIR="$2"; shift 2 ;;
     -t|--threads) THREADS="$2"; shift 2 ;;
     -r|--rate-limit) NUCLEI_RATE_LIMIT="$2"; shift 2 ;;
+    -c|--concurrency) LOOP_CONCURRENCY="$2"; shift 2 ;;
     --sev) SEVERITIES="$2"; shift 2 ;;
     --full) FULL=true; shift ;;
     --amass) AMASS_SCAN=true; shift ;;
@@ -239,8 +264,6 @@ if [ -z "$DOMAIN" ] && [ -z "$DOMAIN_LIST" ]; then
 fi
 
 # ---------- Sanitize domain input ----------
-# Accepts a full URL by mistake (https://www.example.com/path) and reduces it
-# to a bare domain (www.example.com), so downstream tools and folder names don't break.
 sanitize_domain() {
   local d="$1"
   d="${d#http://}"; d="${d#https://}"   # strip scheme
@@ -279,6 +302,7 @@ if [ -n "$DOMAIN_LIST" ]; then
 fi
 
 # ---------- Setup ----------
+SCRIPT_START_EPOCH=$(date +%s)
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 OUTDIR="${OUTDIR:-${DOMAIN}_${TIMESTAMP}}"
 mkdir -p "$OUTDIR"/{raw,final,http,vulns,ports,urls,js,cloud,github,cors,waf,asn,favicon,logs,bruteforce,shodan,params,api,xss,sqli}
@@ -308,10 +332,6 @@ fi
 
 run_if_available() {
   local tool="$1"; shift
-  # Redirect stdin from /dev/null: if this tool (or a library it depends on,
-  # e.g. a package quietly running `sudo something` on first use) ever tries
-  # to prompt interactively, it fails fast instead of silently hanging the
-  # whole script — this bit us once with asnmap and could happen with any tool.
   if have "$tool"; then "$@" < /dev/null; else warn "Skipping $tool (not installed)"; fi
 }
 
@@ -322,7 +342,12 @@ log "Phase 1: Subdomain enumeration"
 run_if_available subfinder subfinder -d "$DOMAIN" -all -recursive -t "$THREADS" -silent -o raw/subfinder.txt & BG_PIDS+=("$!")
 run_if_available assetfinder bash -c "assetfinder -subs-only '$DOMAIN' > raw/assetfinder.txt" & BG_PIDS+=("$!")
 run_if_available findomain findomain -t "$DOMAIN" -u raw/findomain.txt & BG_PIDS+=("$!")
-run_if_available sublist3r sublist3r -d "$DOMAIN" -t 50 -o raw/sublist3r.txt & BG_PIDS+=("$!")
+# -e excludes dnsdumpster: its CSRF-token regex no longer matches DNSdumpster's
+# current page, so that one engine always crashes with an IndexError (worker
+# dies, prints a traceback) while contributing nothing. Everything else still runs.
+run_if_available sublist3r sublist3r -d "$DOMAIN" -t 50 \
+  -e "baidu,yahoo,google,bing,ask,netcraft,virustotal,threatcrowd,ssl,passivedns" \
+  -o raw/sublist3r.txt & BG_PIDS+=("$!")
 run_if_available subdominator bash -c "subdominator -d '$DOMAIN' > raw/subdominator.txt" & BG_PIDS+=("$!")
 if [ "$AMASS_SCAN" = true ]; then
   run_if_available amass bash -c "amass enum -passive -d '$DOMAIN' -o raw/amass.txt" & BG_PIDS+=("$!")
@@ -345,10 +370,6 @@ ok "Subdomain enumeration complete"
 # PHASE 2: Merge, Dedup, Clean
 # ========================================================================
 log "Phase 2: Merging and deduplicating"
-# The pattern matches the bare target domain ITSELF as well as any subdomain of it.
-# Without the "(label.)?" prefix being optional, a target that is already a
-# subdomain (e.g. press.priceline.com) with no further sub-subdomains discovered
-# would get filtered down to zero results and the whole run would exit early.
 cat raw/*.txt 2>/dev/null \
   | grep -E "^([a-zA-Z0-9._-]+\.)?${DOMAIN//./\\.}$" \
   | tr '[:upper:]' '[:lower:]' \
@@ -414,7 +435,6 @@ if [ -n "$BRUTE_WORDLIST" ]; then
   if [ ! -f "$BRUTE_WORDLIST" ]; then
     warn "Bruteforce wordlist not found: $BRUTE_WORDLIST — skipping"
   else
-    # Permutation: expand known subdomains into likely variants (dev-api, api-dev, etc.)
     if have dnsgen; then
       dnsgen final/all_subs.txt 2>>"$LOGFILE" > bruteforce/permutations.txt || true
     elif have altdns; then
@@ -426,9 +446,6 @@ if [ -n "$BRUTE_WORDLIST" ]; then
     cat "$BRUTE_WORDLIST" bruteforce/permutations.txt 2>/dev/null \
       | sed "s/\$/.${DOMAIN}/" | sort -u > bruteforce/brute_candidates.txt 2>/dev/null || true
 
-    # puredns and massdns both need a plain list of resolver IPs (one per line),
-    # NOT /etc/resolv.conf's "nameserver X.X.X.X" format. Write a small public
-    # resolver list ourselves so this works out of the box with no setup.
     cat > bruteforce/resolvers.txt <<'RESOLVERS'
 1.1.1.1
 8.8.8.8
@@ -437,7 +454,6 @@ if [ -n "$BRUTE_WORDLIST" ]; then
 1.0.0.1
 RESOLVERS
 
-    # Resolution: resolve all candidates at once, fast
     if have puredns; then
       puredns resolve bruteforce/brute_candidates.txt -r bruteforce/resolvers.txt \
         --write bruteforce/brute_resolved.txt 2>>"$LOGFILE" || true
@@ -450,8 +466,6 @@ RESOLVERS
     BRUTE_COUNT=$(countf bruteforce/brute_resolved.txt)
     ok "Bruteforce found: $BRUTE_COUNT resolved candidate(s)"
     if [ "$BRUTE_COUNT" -gt 0 ]; then
-      # puredns --write gives clean hostnames already. massdns -o S gives
-      # "hostname. A 1.2.3.4" lines — normalize both to bare hostnames before merging.
       awk '{gsub(/\.$/, "", $1); print $1}' bruteforce/brute_resolved.txt \
         | grep -E "\.${DOMAIN//./\\.}$" >> final/all_subs.txt
       sort -u -o final/all_subs.txt final/all_subs.txt
@@ -465,14 +479,20 @@ fi
 if [ "$SHODAN_LOOKUP" = true ]; then
   log "Phase 7: Enriching resolved IPs via Shodan InternetDB"
   if have curl && have dig; then
-    : > shodan/internetdb_results.json
+    HOST_COUNT=$(countf "$RESOLVED_FILE")
+    log "Resolving $HOST_COUNT host(s) to IPs first (this used to be the step that looked stuck)"
+    : > shodan/resolved_ips.txt
+    i=0
     while read -r host; do
-      ip=$(dig +short "$host" 2>/dev/null | head -n1)
-      [ -z "$ip" ] && continue
-      curl -s "https://internetdb.shodan.io/$ip" >> shodan/internetdb_results.json 2>>"$LOGFILE" || true
-      echo "" >> shodan/internetdb_results.json
-      sleep 0.3
-    done < "$RESOLVED_FILE"
+      i=$((i + 1))
+      [ $((i % 100)) -eq 0 ] && log "  DNS lookup progress: $i / $HOST_COUNT"
+      dig +short +time=2 +tries=1 "$host" 2>/dev/null | head -n1
+    done < "$RESOLVED_FILE" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u > shodan/resolved_ips.txt
+    IP_COUNT=$(countf shodan/resolved_ips.txt)
+    ok "Deduplicated to $IP_COUNT unique IP(s) — querying Shodan InternetDB in parallel"
+    : > shodan/internetdb_results.json
+    run_parallel shodan/resolved_ips.txt "Shodan InternetDB lookup" \
+      'curl -s -m 5 "https://internetdb.shodan.io/$1" >> shodan/internetdb_results.json; echo >> shodan/internetdb_results.json'
     ok "Shodan InternetDB lookups saved to shodan/internetdb_results.json (free tier, no key needed)"
   else
     warn "curl or dig not available, skipping Shodan InternetDB lookup"
@@ -485,10 +505,6 @@ fi
 if [ "$ASN_SCAN" = true ]; then
   log "Phase 8: ASN / IP range discovery"
   if have asnmap; then
-    # asnmap needs a one-time ProjectDiscovery Cloud auth (run `asnmap -auth` once
-    # and log in). Without it, asnmap prompts interactively for an API key and
-    # will hang the whole script waiting on stdin — redirect stdin from
-    # /dev/null so it fails fast instead of blocking.
     asnmap -d "$DOMAIN" -silent -o asn/ranges.txt < /dev/null 2>>"$LOGFILE" || true
     ASN_COUNT=$(countf asn/ranges.txt)
     if [ "$ASN_COUNT" -eq 0 ]; then
@@ -507,9 +523,6 @@ fi
 if [ "$PORTSCAN" = true ]; then
   log "Phase 9: Port scanning with naabu"
   if have naabu; then
-    # naabu's default SYN scan needs raw-socket access (root). Running
-    # unprivileged silently returns 0 results with no error — use CONNECT
-    # scan instead, which works fine without root (slightly slower, but reliable).
     if [ "$(id -u)" -eq 0 ]; then
       naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
     else
@@ -562,9 +575,9 @@ fi
 if [ "$WAF_CHECK" = true ]; then
   log "Phase 12: WAF/CDN fingerprinting"
   if have wafw00f; then
-    while read -r url; do
-      wafw00f "$url" >> waf/waf_results.txt 2>>"$LOGFILE"
-    done < http/live_urls.txt
+    : > waf/waf_results.txt
+    run_parallel http/live_urls.txt "WAF/CDN fingerprinting" \
+      'wafw00f "$1" >> waf/waf_results.txt 2>>'"$LOGFILE"
     ok "WAF detection results saved to waf/waf_results.txt"
   else
     warn "wafw00f not installed, skipping"
@@ -577,8 +590,6 @@ fi
 if [ "$FAVICON_SCAN" = true ]; then
   log "Phase 13: Favicon-hash fingerprinting"
   if have favfreak; then
-    # favfreak takes URLs on stdin, not a -f flag, and -o is an output *prefix*
-    # (it writes <prefix>_<hash>.txt files), not a directory.
     cat http/live_urls.txt | favfreak -o favicon/results 2>>"$LOGFILE" || true
     ok "Favicon fingerprints saved to favicon/"
   else
@@ -627,17 +638,13 @@ fi
 if [ "$PARAM_DISCOVERY" = true ]; then
   log "Phase 15: Hidden parameter discovery"
   if have arjun; then
-    while read -r url; do
-      name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
-      arjun -u "$url" -oT "params/arjun_${name}.txt" -q 2>>"$LOGFILE" || true
-    done < http/live_urls.txt
+    run_parallel http/live_urls.txt "Arjun parameter discovery" \
+      'name=$(echo "$1" | sed "s#[^a-zA-Z0-9]#_#g"); arjun -u "$1" -oT "params/arjun_${name}.txt" -q >>'"$LOGFILE"' 2>&1'
     ok "Arjun parameter discovery complete, see params/"
   else
     warn "arjun not installed, skipping"
   fi
   if have paramspider; then
-    # paramspider has no -o flag — it writes to its own ./results/<domain>.txt by default.
-    # Run it, then move whatever it produced into our own output folder.
     while read -r d; do
       ( cd params && paramspider -d "$d" >> "../logs/recon.log" 2>&1 ) || true
     done < final/all_subs.txt
@@ -653,10 +660,6 @@ fi
 # ========================================================================
 if [ "$API_SCAN" = true ]; then
   log "Phase 16: API route bruteforce"
-  # kiterunner's real binary is 'kr', not 'kiterunner'. It needs a compiled
-  # .kite wordlist (not plain text) — if the user passed one via --api <file>,
-  # use it with -w; otherwise fall back to kiterunner's own hosted Assetnote
-  # wordlist (-A), which needs no local file at all.
   if have kr; then
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
@@ -710,19 +713,15 @@ if [ "$JS_SCAN" = true ]; then
       warn "Neither trufflehog nor gitleaks installed, skipping JS secrets scan"
     fi
     if have linkfinder; then
-      while read -r jsurl; do
-        name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
-        linkfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/linkfinder_${name}.txt" || true
-      done < js/js_files.txt
+      run_parallel js/js_files.txt "LinkFinder endpoint extraction" \
+        'name=$(echo "$1" | sed "s#[^a-zA-Z0-9]#_#g"); linkfinder -i "$1" -o cli >> "js/linkfinder_${name}.txt" 2>>'"$LOGFILE"
       ok "LinkFinder endpoint extraction complete, see js/linkfinder_*.txt"
     else
       warn "linkfinder not installed, skipping JS endpoint extraction"
     fi
     if have secretfinder; then
-      while read -r jsurl; do
-        name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
-        secretfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/secretfinder_${name}.txt" || true
-      done < js/js_files.txt
+      run_parallel js/js_files.txt "SecretFinder scan" \
+        'name=$(echo "$1" | sed "s#[^a-zA-Z0-9]#_#g"); secretfinder -i "$1" -o cli >> "js/secretfinder_${name}.txt" 2>>'"$LOGFILE"
       ok "SecretFinder scan complete, see js/secretfinder_*.txt"
     else
       warn "secretfinder not installed, skipping"
@@ -779,8 +778,6 @@ if [ "$CLOUD_SCAN" = true ]; then
   if have cloud_enum; then
     cloud_enum -k "$DOMAIN" --disable-azure --disable-gcp -l cloud/cloud_enum.txt 2>>"$LOGFILE" || true
   elif have s3scanner; then
-    # Real binary is lowercase 's3scanner', no 'scan' subcommand, and the flag
-    # is single-dash '-bucket-file' (Go-style flags), not '--bucket-file'.
     s3scanner -bucket-file final/all_subs.txt -json > cloud/s3_results.json 2>>"$LOGFILE" || true
   else
     warn "No cloud enumeration tool installed (cloud_enum / s3scanner), skipping"
@@ -855,12 +852,13 @@ nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -si
 FINDINGS=$(countf vulns/nuclei_results.txt)
 ok "Nuclei findings: $FINDINGS"
 
+SCRIPT_END_EPOCH=$(date +%s)
+ELAPSED=$((SCRIPT_END_EPOCH - SCRIPT_START_EPOCH))
+ELAPSED_FMT=$(printf '%dh %dm %ds' $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60)))
+
 # ========================================================================
 # CLEANUP: Remove empty output folders
 # ========================================================================
-# mkdir -p creates every module's folder upfront regardless of which modules
-# actually ran, so unused ones (e.g. sqli/ when --sqli was never passed) are
-# left behind empty. Clean those up now that every phase has finished writing.
 log "Cleaning up empty output folders"
 EMPTIED=0
 for i in 1 2; do
@@ -877,6 +875,7 @@ SUMMARY="final/SUMMARY.md"
 cat > "$SUMMARY" <<EOF
 # Recon Summary — $DOMAIN
 Generated: $(date '+%Y-%m-%d %H:%M:%S')
+Total run time: $ELAPSED_FMT
 
 | Stage                          | Count |
 |---------------------------------|-------|
