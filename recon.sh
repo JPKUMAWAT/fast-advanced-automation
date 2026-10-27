@@ -504,7 +504,7 @@ RESOLVERS
       # puredns --write gives clean hostnames already. massdns -o S gives
       # "hostname. A 1.2.3.4" lines — normalize both to bare hostnames before merging.
       awk '{gsub(/\.$/, "", $1); print $1}' bruteforce/brute_resolved.txt \
-        | grep -E "\.${DOMAIN//./\\.}$" >> final/all_subs.txt
+        | grep -E "^([a-zA-Z0-9._-]+\.)?${DOMAIN//./\\.}$" >> final/all_subs.txt
       sort -u -o final/all_subs.txt final/all_subs.txt
     fi
   fi
@@ -570,10 +570,32 @@ if [ "$ASN_SCAN" = true ]; then
 fi
 
 # ========================================================================
-# PHASE 9: Port Scanning (optional)
+# PHASE 9: HTTP Probing
+# ========================================================================
+# Runs BEFORE port scanning on purpose: naabu's active port scan can trip a
+# target's WAF/rate-limiter, which can then cause the very next phase's
+# requests to fail — we saw this exact pattern (port scan -> 0 live hosts
+# right after, on a host confirmed live moments earlier). Capturing live
+# hosts first means that data survives even if the port scan upsets the WAF.
+log "Phase 9: HTTP(S) probing with $HTTPX_BIN"
+"$HTTPX_BIN" -l "$RESOLVED_FILE" -silent -status-code -title -tech-detect -follow-redirects \
+  -threads "$THREADS" -o http/live_hosts.txt
+LIVE_COUNT=$(countf http/live_hosts.txt)
+ok "Live HTTP(S) hosts: $LIVE_COUNT"
+awk '{print $1}' http/live_hosts.txt > http/live_urls.txt
+if [ ! -s http/live_urls.txt ]; then
+  warn "No live HTTP(S) hosts found. This can be a transient network/WAF issue rather"
+  warn "than a real result — all subdomain/DNS work so far is still saved. Host-dependent"
+  warn "modules below will have nothing to scan and will show 0, but the run continues"
+  warn "so you get a summary instead of losing everything. Consider re-running if this"
+  warn "looks wrong (check logs/recon.log for connectivity errors from this run)."
+fi
+
+# ========================================================================
+# PHASE 10: Port Scanning (optional)
 # ========================================================================
 if [ "$PORTSCAN" = true ]; then
-  log "Phase 9: Port scanning with naabu"
+  log "Phase 10: Port scanning with naabu"
   if have naabu; then
     # naabu's default SYN scan needs raw-socket access (root). Running
     # unprivileged silently returns 0 results with no error — use CONNECT
@@ -588,23 +610,6 @@ if [ "$PORTSCAN" = true ]; then
   else
     warn "naabu not installed, skipping port scan"
   fi
-fi
-
-# ========================================================================
-# PHASE 10: HTTP Probing
-# ========================================================================
-log "Phase 10: HTTP(S) probing with $HTTPX_BIN"
-"$HTTPX_BIN" -l "$RESOLVED_FILE" -silent -status-code -title -tech-detect -follow-redirects \
-  -threads "$THREADS" -o http/live_hosts.txt
-LIVE_COUNT=$(countf http/live_hosts.txt)
-ok "Live HTTP(S) hosts: $LIVE_COUNT"
-awk '{print $1}' http/live_hosts.txt > http/live_urls.txt
-if [ ! -s http/live_urls.txt ]; then
-  warn "No live HTTP(S) hosts found. This can be a transient network/WAF issue rather"
-  warn "than a real result — all subdomain/DNS work so far is still saved. Host-dependent"
-  warn "modules below will have nothing to scan and will show 0, but the run continues"
-  warn "so you get a summary instead of losing everything. Consider re-running if this"
-  warn "looks wrong (check logs/recon.log for connectivity errors from this run)."
 fi
 
 # ========================================================================
@@ -632,7 +637,7 @@ if [ "$WAF_CHECK" = true ]; then
   if have wafw00f; then
     while read -r url; do
       wafw00f "$url" >> waf/waf_results.txt 2>>"$LOGFILE"
-    done < http/live_urls.txt
+    done < <(cap_list http/live_urls.txt 200 "Phase WAF check")
     ok "WAF detection results saved to waf/waf_results.txt"
   else
     warn "wafw00f not installed, skipping"
@@ -676,12 +681,18 @@ if [ "$CRAWL" = true ]; then
     warn "hakrawler not installed, skipping"
   fi
   if have gau; then
-    while read -r d; do gau --subs "$d" 2>>"$LOGFILE"; done < final/all_subs.txt > urls/gau.txt
+    # One gau process per subdomain, sequential — on a target with thousands
+    # of subdomains (we've seen 3000+ on a real run) this is the same class
+    # of multi-hour slowdown fixed elsewhere in this phase for other tools.
+    while read -r d; do gau --subs "$d" 2>>"$LOGFILE"; done < <(cap_list final/all_subs.txt 300 "Phase gau historical URLs") > urls/gau.txt
   else
     warn "gau not installed, skipping"
   fi
   if have waybackurls; then
-    cat final/all_subs.txt | waybackurls > urls/wayback.txt 2>>"$LOGFILE" || true
+    # waybackurls queries the Wayback Machine per-subdomain internally even
+    # though it takes the whole list on stdin in one process — same cap
+    # applied for the same reason as gau above.
+    cap_list final/all_subs.txt 300 "Phase waybackurls" | waybackurls > urls/wayback.txt 2>>"$LOGFILE" || true
   else
     warn "waybackurls not installed, skipping"
   fi
@@ -698,7 +709,7 @@ if [ "$PARAM_DISCOVERY" = true ]; then
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
       arjun -u "$url" -oT "params/arjun_${name}.txt" -q 2>>"$LOGFILE" || true
-    done < http/live_urls.txt
+    done < <(cap_list http/live_urls.txt 150 "Phase Arjun parameter discovery")
     ok "Arjun parameter discovery complete, see params/"
   else
     warn "arjun not installed, skipping"
@@ -708,7 +719,7 @@ if [ "$PARAM_DISCOVERY" = true ]; then
     # Run it, then move whatever it produced into our own output folder.
     while read -r d; do
       ( cd params && paramspider -d "$d" >> "../logs/recon.log" 2>&1 ) || true
-    done < final/all_subs.txt
+    done < <(cap_list final/all_subs.txt 200 "Phase ParamSpider")
     [ -d params/results ] && mv params/results/* params/ 2>/dev/null && rmdir params/results 2>/dev/null
     ok "ParamSpider discovery complete, see params/"
   else
@@ -726,6 +737,8 @@ if [ "$API_SCAN" = true ]; then
   # use it with -w; otherwise fall back to kiterunner's own hosted Assetnote
   # wordlist (-A), which needs no local file at all.
   if have kr; then
+    # Each call tests up to 20,000 routes against ONE host — by far the
+    # heaviest per-host tool in the pipeline, so it gets the tightest cap.
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
       if [ -n "$API_WORDLIST" ] && [ -f "$API_WORDLIST" ]; then
@@ -733,7 +746,7 @@ if [ "$API_SCAN" = true ]; then
       else
         kr scan "$url" -A=apiroutes-210228:20000 --output json 2>>"$LOGFILE" > "api/kiterunner_${name}.json" || true
       fi
-    done < http/live_urls.txt
+    done < <(cap_list http/live_urls.txt 40 "Phase kiterunner (up to 20k routes PER host)")
     ok "kiterunner API route scan complete, see api/"
   else
     warn "kr (kiterunner) not installed, skipping API bruteforce"
@@ -751,7 +764,7 @@ if [ -n "$FFUF_WORDLIST" ]; then
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
       ffuf -u "${url}/FUZZ" -w "$FFUF_WORDLIST" -mc 200,204,301,302,307,401,403 \
         -silent -o "urls/ffuf/${name}.json" -of json 2>>"$LOGFILE" || true
-    done < http/live_urls.txt
+    done < <(cap_list http/live_urls.txt 100 "Phase ffuf directory brute-force")
     ok "ffuf results saved to urls/ffuf/"
   else
     warn "ffuf not installed or wordlist missing, skipping brute-force"
@@ -781,7 +794,7 @@ if [ "$JS_SCAN" = true ]; then
       while read -r jsurl; do
         name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
         linkfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/linkfinder_${name}.txt" || true
-      done < js/js_files.txt
+      done < <(cap_list js/js_files.txt 300 "Phase LinkFinder")
       ok "LinkFinder endpoint extraction complete, see js/linkfinder_*.txt"
     else
       warn "linkfinder not installed, skipping JS endpoint extraction"
@@ -790,7 +803,7 @@ if [ "$JS_SCAN" = true ]; then
       while read -r jsurl; do
         name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
         secretfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/secretfinder_${name}.txt" || true
-      done < js/js_files.txt
+      done < <(cap_list js/js_files.txt 300 "Phase SecretFinder")
       ok "SecretFinder scan complete, see js/secretfinder_*.txt"
     else
       warn "secretfinder not installed, skipping"
@@ -807,7 +820,12 @@ if [ "$XSS_SCAN" = true ]; then
     PARAM_URLS="xss/param_urls.txt"
     grep -E '\?.+=' urls/all_urls.txt 2>/dev/null | sort -u > "$PARAM_URLS" || touch "$PARAM_URLS"
     if [ -s "$PARAM_URLS" ]; then
-      dalfox file "$PARAM_URLS" --silence -o xss/dalfox_results.txt 2>>"$LOGFILE" || true
+      # A large crawl can turn up hundreds of parameterized URLs, and dalfox
+      # tries multiple payloads per URL — uncapped, this can run for many
+      # minutes with no progress output (we saw 11+ min on a real target).
+      cap_list "$PARAM_URLS" 150 "Phase XSS" > xss/.capped_param_urls.txt
+      dalfox file xss/.capped_param_urls.txt --silence --timeout 8 -o xss/dalfox_results.txt 2>>"$LOGFILE" || true
+      rm -f xss/.capped_param_urls.txt
       XSS_COUNT=$(countf xss/dalfox_results.txt)
       [ "$XSS_COUNT" -gt 0 ] && warn "Possible XSS finding(s): $XSS_COUNT — see xss/dalfox_results.txt" || ok "No XSS indicators found"
     else
@@ -828,8 +846,15 @@ if [ "$SQLI_SCAN" = true ]; then
     PARAM_URLS_SQLI="sqli/param_urls.txt"
     grep -E '\?.+=' urls/all_urls.txt 2>/dev/null | sort -u > "$PARAM_URLS_SQLI" || touch "$PARAM_URLS_SQLI"
     if [ -s "$PARAM_URLS_SQLI" ]; then
-      sqlmap -m "$PARAM_URLS_SQLI" --batch --level="$SQLI_LEVEL" --risk="$SQLI_RISK" \
+      # sqlmap tests several injection techniques per parameter and does NOT
+      # parallelize a -m targets file itself — uncapped, this is easily the
+      # slowest phase in the whole pipeline on a real crawl (same class of
+      # issue fixed for XSS/dalfox above, but sqlmap has no per-run timeout
+      # flag as reliable as dalfox's, so capping the input is the real fix).
+      cap_list "$PARAM_URLS_SQLI" 50 "Phase SQLi (sqlmap tests multiple techniques per URL)" > sqli/.capped_param_urls.txt
+      sqlmap -m sqli/.capped_param_urls.txt --batch --level="$SQLI_LEVEL" --risk="$SQLI_RISK" \
         --random-agent --output-dir=sqli/ 2>>"$LOGFILE" || true
+      rm -f sqli/.capped_param_urls.txt
       ok "sqlmap detection pass complete, see sqli/ for any findings"
     else
       warn "No parameterized URLs found (run --crawl first) — skipping SQLi scan"
@@ -925,13 +950,16 @@ if [ "$IDOR_SCAN" = true ]; then
     HDRS_B=(); while read -r h; do HDRS_B+=(-H "$h"); done < "$IDOR_SESSION_B"
     : > idor/session_diff_results.txt
     while read -r url; do
-      resp_a=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 8 "${HDRS_A[@]}" "$url" 2>/dev/null)
-      resp_b=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 8 "${HDRS_B[@]}" "$url" 2>/dev/null)
-      echo "$url | A: $resp_a | B: $resp_b" >> idor/session_diff_results.txt
-      if [ "$resp_a" = "$resp_b" ] && [ -n "$resp_a" ]; then
-        echo "$url | IDENTICAL response for both accounts (A: $resp_a, B: $resp_b)" >> idor/flagged_identical.txt
-      fi
-    done < <(cap_list idor/id_candidates.txt 300 "Phase IDOR session-diff (2 requests per URL)")
+      (
+        resp_a=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 5 "${HDRS_A[@]}" "$url" 2>/dev/null)
+        resp_b=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 5 "${HDRS_B[@]}" "$url" 2>/dev/null)
+        echo "$url | A: $resp_a | B: $resp_b" >> idor/session_diff_results.txt
+        if [ "$resp_a" = "$resp_b" ] && [ -n "$resp_a" ]; then
+          echo "$url | IDENTICAL response for both accounts (A: $resp_a, B: $resp_b)" >> idor/flagged_identical.txt
+        fi
+      ) &
+    done < <(cap_list idor/id_candidates.txt 200 "Phase IDOR session-diff (2 requests per URL)")
+    wait
     FLAGGED=$(countf idor/flagged_identical.txt)
     [ "$FLAGGED" -gt 0 ] && warn "$FLAGGED URL(s) gave identical responses to both accounts — see idor/flagged_identical.txt" \
       || ok "No identical-response candidates found"
@@ -942,28 +970,35 @@ if [ "$IDOR_SCAN" = true ]; then
     # a short, concrete list worth testing by hand with a second account.
     ok "Static heuristic mode (no --idor-session-a/-b given): mutating IDs and diffing responses"
     : > idor/mutation_results.txt
+    # Each URL's check runs in the background (like the OOB probing phase) —
+    # sequential 2-requests-per-URL with an 8s timeout each was the slowest
+    # part of a real run (100 candidates could take 25+ minutes). Backgrounded,
+    # the whole capped batch finishes in roughly one request's time instead.
     while read -r url; do
-      # UUIDs can't be sensibly "incremented" — flag them directly for manual
-      # testing instead of trying (and failing) to do arithmetic on a digit
-      # run embedded inside one.
-      if echo "$url" | grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
-        echo "$url | UUID-based ID — can't auto-mutate, test manually with a second account" >> idor/flagged_candidates.txt
-        continue
-      fi
-      id=$(echo "$url" | grep -oE '[0-9]{2,}' | tail -n1)
-      [ -z "$id" ] && continue
-      # 10#$id forces base-10 parsing — without it, an ID with a leading zero
-      # (e.g. 042) is misread as octal by bash arithmetic and can crash on
-      # digits like 8/9 that aren't valid octal ("value too great for base").
-      mutated=$((10#$id + 1))
-      murl="${url/$id/$mutated}"
-      orig=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 8 "$url" 2>/dev/null)
-      mut=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 8 "$murl" 2>/dev/null)
-      echo "$url | orig: $orig | +1: $mut ($murl)" >> idor/mutation_results.txt
-      if [ "$orig" = "$mut" ] && [ -n "$orig" ] && [[ "$orig" == 200* ]]; then
-        echo "$url -> $murl | both return $orig — worth testing by hand" >> idor/flagged_candidates.txt
-      fi
-    done < <(head -n 100 idor/id_candidates.txt)   # capped — this mode is a heuristic, not exhaustive
+      (
+        # UUIDs can't be sensibly "incremented" — flag them directly for manual
+        # testing instead of trying (and failing) to do arithmetic on a digit
+        # run embedded inside one.
+        if echo "$url" | grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+          echo "$url | UUID-based ID — can't auto-mutate, test manually with a second account" >> idor/flagged_candidates.txt
+          exit 0
+        fi
+        id=$(echo "$url" | grep -oE '[0-9]{2,}' | tail -n1)
+        [ -z "$id" ] && exit 0
+        # 10#$id forces base-10 parsing — without it, an ID with a leading zero
+        # (e.g. 042) is misread as octal by bash arithmetic and can crash on
+        # digits like 8/9 that aren't valid octal ("value too great for base").
+        mutated=$((10#$id + 1))
+        murl="${url/$id/$mutated}"
+        orig=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 5 "$url" 2>/dev/null)
+        mut=$(curl -s -o /dev/null -w "%{http_code} %{size_download}" --max-time 5 "$murl" 2>/dev/null)
+        echo "$url | orig: $orig | +1: $mut ($murl)" >> idor/mutation_results.txt
+        if [ "$orig" = "$mut" ] && [ -n "$orig" ] && [[ "$orig" == 200* ]]; then
+          echo "$url -> $murl | both return $orig — worth testing by hand" >> idor/flagged_candidates.txt
+        fi
+      ) &
+    done < <(cap_list idor/id_candidates.txt 100 "Phase IDOR static heuristic (2 requests per URL)")
+    wait
     FLAGGED=$(countf idor/flagged_candidates.txt)
     [ "$FLAGGED" -gt 0 ] && warn "$FLAGGED candidate(s) flagged — see idor/flagged_candidates.txt (manual verification required)" \
       || ok "No obvious candidates found in the static heuristic pass"
@@ -1065,7 +1100,12 @@ if [ "$CLOUD_SCAN" = true ]; then
   elif have s3scanner; then
     # Real binary is lowercase 's3scanner', no 'scan' subcommand, and the flag
     # is single-dash '-bucket-file' (Go-style flags), not '--bucket-file'.
-    s3scanner -bucket-file final/all_subs.txt -json > cloud/s3_results.json 2>>"$LOGFILE" || true
+    # Capped for the same reason as gau/waybackurls above — this tries every
+    # line as a bucket name candidate against AWS, which is slow and risks
+    # rate-limiting with thousands of candidates.
+    cap_list final/all_subs.txt 500 "Phase s3scanner" > cloud/.capped_bucket_names.txt
+    s3scanner -bucket-file cloud/.capped_bucket_names.txt -json > cloud/s3_results.json 2>>"$LOGFILE" || true
+    rm -f cloud/.capped_bucket_names.txt
   else
     warn "No cloud enumeration tool installed (cloud_enum / s3scanner), skipping"
   fi
