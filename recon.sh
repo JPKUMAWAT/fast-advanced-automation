@@ -553,14 +553,21 @@ fi
 if [ "$ASN_SCAN" = true ]; then
   log "Phase 8: ASN / IP range discovery"
   if have asnmap; then
-    # asnmap needs a one-time ProjectDiscovery Cloud auth (run `asnmap -auth` once
-    # and log in). Without it, asnmap prompts interactively for an API key and
-    # will hang the whole script waiting on stdin — redirect stdin from
-    # /dev/null so it fails fast instead of blocking.
+    # asnmap needs a one-time ProjectDiscovery Cloud (PDCP) login before it
+    # can return results. Without it, you'll see it print "Enter PDCP API Key
+    # (exit to abort):" below — that's expected and NOT a bug. We redirect
+    # stdin from /dev/null so it fails fast instead of hanging the script
+    # waiting for input that was never going to come.
+    if [ ! -f "$HOME/.config/pdcp/config.yaml" ] && [ ! -f "$HOME/.pdcp.yaml" ]; then
+      warn "asnmap isn't logged in yet — you'll see an API-key prompt below, that's expected."
+      warn "To fix permanently (one-time, outside this script): run 'asnmap -auth', it will"
+      warn "print a URL + a short login code — open the URL in a browser, enter the code,"
+      warn "sign in free at cloud.projectdiscovery.io, and asnmap remembers it from then on."
+    fi
     asnmap -d "$DOMAIN" -silent -o asn/ranges.txt < /dev/null 2>>"$LOGFILE" || true
     ASN_COUNT=$(countf asn/ranges.txt)
     if [ "$ASN_COUNT" -eq 0 ]; then
-      warn "ASN lookup returned nothing — run 'asnmap -auth' once to log in to ProjectDiscovery Cloud, then retry"
+      warn "ASN lookup returned nothing — run 'asnmap -auth' once (see note above) to fix this for good"
     else
       ok "ASN ranges: $ASN_COUNT (review before scanning — often broader than bounty scope)"
     fi
@@ -823,7 +830,11 @@ if [ "$XSS_SCAN" = true ]; then
       # A large crawl can turn up hundreds of parameterized URLs, and dalfox
       # tries multiple payloads per URL — uncapped, this can run for many
       # minutes with no progress output (we saw 11+ min on a real target).
-      cap_list "$PARAM_URLS" 150 "Phase XSS" > xss/.capped_param_urls.txt
+      # dalfox defaults to 100 internal workers already, so this cap is mainly
+      # a safety margin against degraded network conditions (not dalfox being
+      # unparallelized) — if requests are timing out due to network issues,
+      # no amount of capping fully avoids a slow phase, only bounds it.
+      cap_list "$PARAM_URLS" 100 "Phase XSS" > xss/.capped_param_urls.txt
       dalfox file xss/.capped_param_urls.txt --silence --timeout 8 -o xss/dalfox_results.txt 2>>"$LOGFILE" || true
       rm -f xss/.capped_param_urls.txt
       XSS_COUNT=$(countf xss/dalfox_results.txt)
@@ -1162,8 +1173,11 @@ cp final/all_subs.txt "$PREV_FILE"
 if [ "$SCREENSHOTS" = true ]; then
   log "Phase 29: Screenshots with gowitness"
   if have gowitness; then
-    gowitness file -f http/live_urls.txt -P http/screenshots/ --no-http 2>>"$LOGFILE" || \
-      gowitness scan file -f http/live_urls.txt -P http/screenshots/ 2>>"$LOGFILE" || true
+    # gowitness v3 restructured its CLI: the old top-level "file" command and
+    # "-P" shorthand are both gone. Current syntax is "scan file -f <list>
+    # --screenshot-path <dir>" (confirmed against the official v3 docs).
+    mkdir -p http/screenshots
+    gowitness scan file -f http/live_urls.txt --screenshot-path http/screenshots/ --threads 10 2>>"$LOGFILE" || true
     ok "Screenshots saved to http/screenshots/"
   else
     warn "gowitness not installed, skipping screenshots"
