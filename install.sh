@@ -233,7 +233,27 @@ else
 fi
 
 pip_install wafw00f wafw00f
-pip_install cloud_enum cloudenum
+# cloud_enum's upstream project now uses `uv` for dependency management —
+# a plain `pip install` leaves it broken at runtime ("Missing dependencies,
+# please run 'uv sync'"). `uv tool install` builds a proper standalone
+# command instead. Note: upstream has also said cloud_enum is winding down
+# in favor of Nuclei templates for cloud-asset detection going forward.
+if have cloud_enum; then
+  ok "cloud_enum already installed, skipping"
+else
+  log "Installing cloud_enum (via uv tool install)..."
+  if ! have uv; then
+    log "Installing uv (cloud_enum's package manager)..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+    export PATH="$PATH:$HOME/.local/bin"
+  fi
+  if have uv; then
+    uv tool install git+https://github.com/initstring/cloud_enum >/dev/null 2>&1
+    have cloud_enum && ok "cloud_enum installed" || warn "cloud_enum install failed — try manually: uv tool install git+https://github.com/initstring/cloud_enum"
+  else
+    warn "uv install failed, skipping cloud_enum — see https://github.com/initstring/cloud_enum"
+  fi
+fi
 
 # S3Scanner — go-installable; the actual binary name is lowercase 's3scanner'
 go_install s3scanner github.com/sa7mon/s3scanner
