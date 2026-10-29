@@ -131,6 +131,31 @@ countf() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
 # Caps a host/URL list to $2 lines before a slow per-item loop, warning once if
 # it had to trim — the same fix that made Phase 7 (Shodan) fast on large scopes,
 # applied anywhere else a new module loops over live_urls.txt/resolved hosts.
+# Prints a reassurance line every 30s while a slow, silent phase runs, so a
+# long-but-working scan never looks indistinguishable from a hung one. This
+# directly addresses phases (crawling, XSS) that have no native progress
+# output of their own and would otherwise sit silent for minutes at a time.
+start_heartbeat() {
+  local label="$1"
+  ( local n=0
+    while true; do
+      sleep 30
+      n=$((n + 30))
+      log "$label: still running (${n}s elapsed — this is normal for a thorough scan, not stuck)"
+    done
+  ) &
+  HEARTBEAT_PID=$!
+  BG_PIDS+=("$HEARTBEAT_PID")
+}
+stop_heartbeat() {
+  # killtree, not a plain kill: the heartbeat subshell's own "sleep 30" child
+  # is a separate process that a single kill on the parent PID won't reach —
+  # the exact leak class killtree() exists to catch.
+  [ -n "${HEARTBEAT_PID:-}" ] && killtree "$HEARTBEAT_PID"
+  wait "$HEARTBEAT_PID" 2>/dev/null
+  HEARTBEAT_PID=""
+}
+
 cap_list() {
   local file="$1" cap="$2" label="$3" total
   total=$(countf "$file")
@@ -671,6 +696,7 @@ fi
 # ========================================================================
 if [ "$CRAWL" = true ]; then
   log "Phase 14: Crawling + historical URL discovery"
+  start_heartbeat "Phase 14 crawl"
   if have katana; then
     katana -list http/live_urls.txt -silent -jc -o urls/katana.txt 2>>"$LOGFILE" || true
   else
@@ -703,6 +729,7 @@ if [ "$CRAWL" = true ]; then
   else
     warn "waybackurls not installed, skipping"
   fi
+  stop_heartbeat
   cat urls/*.txt 2>/dev/null | sort -u > urls/all_urls.txt
   ok "Total discovered URLs: $(countf urls/all_urls.txt)"
 fi
@@ -712,6 +739,7 @@ fi
 # ========================================================================
 if [ "$PARAM_DISCOVERY" = true ]; then
   log "Phase 15: Hidden parameter discovery"
+  start_heartbeat "Phase 15 parameter discovery"
   if have arjun; then
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
@@ -732,6 +760,7 @@ if [ "$PARAM_DISCOVERY" = true ]; then
   else
     warn "paramspider not installed, skipping"
   fi
+  stop_heartbeat
 fi
 
 # ========================================================================
@@ -835,7 +864,9 @@ if [ "$XSS_SCAN" = true ]; then
       # unparallelized) — if requests are timing out due to network issues,
       # no amount of capping fully avoids a slow phase, only bounds it.
       cap_list "$PARAM_URLS" 100 "Phase XSS" > xss/.capped_param_urls.txt
+      start_heartbeat "Phase 19 XSS scan"
       dalfox file xss/.capped_param_urls.txt --silence --timeout 8 -o xss/dalfox_results.txt 2>>"$LOGFILE" || true
+      stop_heartbeat
       rm -f xss/.capped_param_urls.txt
       XSS_COUNT=$(countf xss/dalfox_results.txt)
       [ "$XSS_COUNT" -gt 0 ] && warn "Possible XSS finding(s): $XSS_COUNT — see xss/dalfox_results.txt" || ok "No XSS indicators found"
@@ -1188,7 +1219,11 @@ fi
 # PHASE 30: Vulnerability Scanning (nuclei)
 # ========================================================================
 log "Phase 30: Nuclei scan (severity: $SEVERITIES, rate-limit: $NUCLEI_RATE_LIMIT req/s)"
-nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent \
+# -silent alone prints NOTHING until a finding shows up — on a full template
+# set against one host this can legitimately run 10+ minutes with zero visible
+# output, which looks identical to "hung". -stats is fully compatible with
+# -silent and prints a periodic one-line progress update instead.
+nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent -stats -stats-interval 20 \
   -o vulns/nuclei_results.txt -je vulns/nuclei_results.json
 FINDINGS=$(countf vulns/nuclei_results.txt)
 ok "Nuclei findings: $FINDINGS"
