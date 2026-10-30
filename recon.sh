@@ -633,10 +633,10 @@ if [ "$PORTSCAN" = true ]; then
     # unprivileged silently returns 0 results with no error — use CONNECT
     # scan instead, which works fine without root (slightly slower, but reliable).
     if [ "$(id -u)" -eq 0 ]; then
-      timeout 180 naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+      timeout 180 naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt > /dev/null 2>>"$LOGFILE" || true
     else
       warn "Not running as root — naabu would silently find 0 ports with its default SYN scan. Using -scan-type connect instead."
-      timeout 180 naabu -l "$RESOLVED_FILE" -scan-type connect -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+      timeout 180 naabu -l "$RESOLVED_FILE" -scan-type connect -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt > /dev/null 2>>"$LOGFILE" || true
     fi
     ok "Open ports found: $(countf ports/open_ports.txt)"
   else
@@ -650,12 +650,12 @@ fi
 if [ "$TAKEOVER" = true ]; then
   log "Phase 11: Subdomain takeover check"
   if have subzy; then
-    timeout 180 subzy run --targets final/resolved.txt --output vulns/takeover_subzy.txt 2>>"$LOGFILE" || true
+    timeout 180 subzy run --targets final/resolved.txt --output vulns/takeover_subzy.txt > /dev/null 2>>"$LOGFILE" || true
   else
     warn "subzy not installed, skipping subzy pass"
   fi
   if have nuclei; then
-    nuclei -l http/live_urls.txt -tags takeover -silent -o vulns/takeover_nuclei.txt 2>>"$LOGFILE" || true
+    nuclei -l http/live_urls.txt -tags takeover -silent -o vulns/takeover_nuclei.txt > /dev/null 2>>"$LOGFILE" || true
     TAKEOVER_COUNT=$(countf vulns/takeover_nuclei.txt)
     [ "$TAKEOVER_COUNT" -gt 0 ] && warn "POSSIBLE TAKEOVER(S): $TAKEOVER_COUNT — see vulns/takeover_nuclei.txt" || ok "No takeover indicators found"
   fi
@@ -684,7 +684,7 @@ if [ "$FAVICON_SCAN" = true ]; then
   if have favfreak; then
     # favfreak takes URLs on stdin, not a -f flag, and -o is an output *prefix*
     # (it writes <prefix>_<hash>.txt files), not a directory.
-    cat http/live_urls.txt | favfreak -o favicon/results 2>>"$LOGFILE" || true
+    cat http/live_urls.txt | favfreak -o favicon/results > /dev/null 2>>"$LOGFILE" || true
     ok "Favicon fingerprints saved to favicon/"
   else
     warn "favfreak not installed, skipping"
@@ -701,12 +701,17 @@ if [ "$CRAWL" = true ]; then
   # a single crawler can otherwise occupy the whole phase indefinitely while
   # the others never even get a turn.
   if have katana; then
-    timeout 180 katana -list http/live_urls.txt -silent -jc -o urls/katana.txt 2>>"$LOGFILE" || true
+    # katana prints found URLs to stdout in ADDITION to writing -o — without
+    # redirecting stdout too, every URL it finds leaks straight to the
+    # terminal instead of staying in the log/output files.
+    timeout 180 katana -list http/live_urls.txt -silent -jc -o urls/katana.txt > /dev/null 2>>"$LOGFILE" || true
   else
     warn "katana not installed, skipping active crawl"
   fi
   if have gospider; then
-    timeout 180 gospider -S http/live_urls.txt -o urls/gospider_raw -q 2>>"$LOGFILE" || true
+    # Same issue as katana — gospider's -q only drops the banner, not its
+    # per-URL stdout output, which duplicates what -o already saves to disk.
+    timeout 180 gospider -S http/live_urls.txt -o urls/gospider_raw -q > /dev/null 2>>"$LOGFILE" || true
     cat urls/gospider_raw/*.txt 2>/dev/null | grep -oE 'https?://[^ ]+' | sort -u > urls/gospider.txt || true
   else
     warn "gospider not installed, skipping"
@@ -832,7 +837,7 @@ if [ "$JS_SCAN" = true ]; then
     if have trufflehog; then
       trufflehog filesystem --directory=js/ --json > js/secrets_trufflehog.json 2>>"$LOGFILE" || true
     elif have gitleaks; then
-      gitleaks detect --no-git --source=js/ --report-path=js/secrets_gitleaks.json 2>>"$LOGFILE" || true
+      gitleaks detect --no-git --source=js/ --report-path=js/secrets_gitleaks.json > /dev/null 2>>"$LOGFILE" || true
     else
       warn "Neither trufflehog nor gitleaks installed, skipping JS secrets scan"
     fi
@@ -1157,7 +1162,7 @@ fi
 if [ "$CLOUD_SCAN" = true ]; then
   log "Phase 25: Cloud storage bucket enumeration"
   if have cloud_enum; then
-    cloud_enum -k "$DOMAIN" --disable-azure --disable-gcp -l cloud/cloud_enum.txt 2>>"$LOGFILE" || true
+    cloud_enum -k "$DOMAIN" --disable-azure --disable-gcp -l cloud/cloud_enum.txt > /dev/null 2>>"$LOGFILE" || true
   elif have s3scanner; then
     # Real binary is lowercase 's3scanner', no 'scan' subcommand, and the flag
     # is single-dash '-bucket-file' (Go-style flags), not '--bucket-file'.
@@ -1194,7 +1199,7 @@ if [ "$CORS_SCAN" = true ]; then
   log "Phase 27: CORS misconfiguration scan"
   if have corsy || have Corsy; then
     CORSY_BIN=$(have corsy && echo corsy || echo Corsy)
-    "$CORSY_BIN" -i http/live_urls.txt -o cors/cors_results.json 2>>"$LOGFILE" || true
+    "$CORSY_BIN" -i http/live_urls.txt -o cors/cors_results.json > /dev/null 2>>"$LOGFILE" || true
     ok "CORS scan complete, see cors/cors_results.json"
   else
     warn "Corsy not installed, skipping CORS scan"
@@ -1227,7 +1232,7 @@ if [ "$SCREENSHOTS" = true ]; then
     # "-P" shorthand are both gone. Current syntax is "scan file -f <list>
     # --screenshot-path <dir>" (confirmed against the official v3 docs).
     mkdir -p http/screenshots
-    gowitness scan file -f http/live_urls.txt --screenshot-path http/screenshots/ --threads 10 2>>"$LOGFILE" || true
+    gowitness scan file -f http/live_urls.txt --screenshot-path http/screenshots/ --threads 10 > /dev/null 2>>"$LOGFILE" || true
     ok "Screenshots saved to http/screenshots/"
   else
     warn "gowitness not installed, skipping screenshots"
