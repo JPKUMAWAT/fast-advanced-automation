@@ -610,7 +610,7 @@ fi
 # right after, on a host confirmed live moments earlier). Capturing live
 # hosts first means that data survives even if the port scan upsets the WAF.
 log "Phase 9: HTTP(S) probing with $HTTPX_BIN"
-"$HTTPX_BIN" -l "$RESOLVED_FILE" -silent -status-code -title -tech-detect -follow-redirects \
+timeout 300 "$HTTPX_BIN" -l "$RESOLVED_FILE" -silent -status-code -title -tech-detect -follow-redirects \
   -threads "$THREADS" -o http/live_hosts.txt
 LIVE_COUNT=$(countf http/live_hosts.txt)
 ok "Live HTTP(S) hosts: $LIVE_COUNT"
@@ -633,10 +633,10 @@ if [ "$PORTSCAN" = true ]; then
     # unprivileged silently returns 0 results with no error — use CONNECT
     # scan instead, which works fine without root (slightly slower, but reliable).
     if [ "$(id -u)" -eq 0 ]; then
-      naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+      timeout 180 naabu -l "$RESOLVED_FILE" -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
     else
       warn "Not running as root — naabu would silently find 0 ports with its default SYN scan. Using -scan-type connect instead."
-      naabu -l "$RESOLVED_FILE" -scan-type connect -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
+      timeout 180 naabu -l "$RESOLVED_FILE" -scan-type connect -silent -rate "$NUCLEI_RATE_LIMIT" -o ports/open_ports.txt 2>>"$LOGFILE" || true
     fi
     ok "Open ports found: $(countf ports/open_ports.txt)"
   else
@@ -650,7 +650,7 @@ fi
 if [ "$TAKEOVER" = true ]; then
   log "Phase 11: Subdomain takeover check"
   if have subzy; then
-    subzy run --targets final/resolved.txt --output vulns/takeover_subzy.txt 2>>"$LOGFILE" || true
+    timeout 180 subzy run --targets final/resolved.txt --output vulns/takeover_subzy.txt 2>>"$LOGFILE" || true
   else
     warn "subzy not installed, skipping subzy pass"
   fi
@@ -668,7 +668,7 @@ if [ "$WAF_CHECK" = true ]; then
   log "Phase 12: WAF/CDN fingerprinting"
   if have wafw00f; then
     while read -r url; do
-      wafw00f "$url" >> waf/waf_results.txt 2>>"$LOGFILE"
+      timeout 30 wafw00f "$url" >> waf/waf_results.txt 2>>"$LOGFILE"
     done < <(cap_list http/live_urls.txt 200 "Phase WAF check")
     ok "WAF detection results saved to waf/waf_results.txt"
   else
@@ -697,19 +697,22 @@ fi
 if [ "$CRAWL" = true ]; then
   log "Phase 14: Crawling + historical URL discovery"
   start_heartbeat "Phase 14 crawl"
+  # Each crawler gets its own hard ceiling — on a slow/rate-limiting target
+  # a single crawler can otherwise occupy the whole phase indefinitely while
+  # the others never even get a turn.
   if have katana; then
-    katana -list http/live_urls.txt -silent -jc -o urls/katana.txt 2>>"$LOGFILE" || true
+    timeout 180 katana -list http/live_urls.txt -silent -jc -o urls/katana.txt 2>>"$LOGFILE" || true
   else
     warn "katana not installed, skipping active crawl"
   fi
   if have gospider; then
-    gospider -S http/live_urls.txt -o urls/gospider_raw -q 2>>"$LOGFILE" || true
+    timeout 180 gospider -S http/live_urls.txt -o urls/gospider_raw -q 2>>"$LOGFILE" || true
     cat urls/gospider_raw/*.txt 2>/dev/null | grep -oE 'https?://[^ ]+' | sort -u > urls/gospider.txt || true
   else
     warn "gospider not installed, skipping"
   fi
   if have hakrawler; then
-    cat http/live_urls.txt | hakrawler -d 2 2>>"$LOGFILE" > urls/hakrawler.txt || true
+    cat http/live_urls.txt | timeout 120 hakrawler -d 2 2>>"$LOGFILE" > urls/hakrawler.txt || true
   else
     warn "hakrawler not installed, skipping"
   fi
@@ -717,7 +720,14 @@ if [ "$CRAWL" = true ]; then
     # One gau process per subdomain, sequential — on a target with thousands
     # of subdomains (we've seen 3000+ on a real run) this is the same class
     # of multi-hour slowdown fixed elsewhere in this phase for other tools.
-    while read -r d; do gau --subs "$d" 2>>"$LOGFILE"; done < <(cap_list final/all_subs.txt 300 "Phase gau historical URLs") > urls/gau.txt
+    # Each call AND the whole loop both get a ceiling — a cap on count alone
+    # doesn't bound time if each individual call itself hangs.
+    GAU_DEADLINE=$(( $(date +%s) + 180 ))
+    : > urls/gau.txt
+    while read -r d; do
+      [ "$(date +%s)" -ge "$GAU_DEADLINE" ] && { warn "Phase gau: 180s overall ceiling reached, stopping early"; break; }
+      timeout 15 gau --subs "$d" 2>>"$LOGFILE" >> urls/gau.txt
+    done < <(cap_list final/all_subs.txt 300 "Phase gau historical URLs")
   else
     warn "gau not installed, skipping"
   fi
@@ -725,7 +735,7 @@ if [ "$CRAWL" = true ]; then
     # waybackurls queries the Wayback Machine per-subdomain internally even
     # though it takes the whole list on stdin in one process — same cap
     # applied for the same reason as gau above.
-    cap_list final/all_subs.txt 300 "Phase waybackurls" | waybackurls > urls/wayback.txt 2>>"$LOGFILE" || true
+    cap_list final/all_subs.txt 300 "Phase waybackurls" | timeout 180 waybackurls > urls/wayback.txt 2>>"$LOGFILE" || true
   else
     warn "waybackurls not installed, skipping"
   fi
@@ -743,7 +753,7 @@ if [ "$PARAM_DISCOVERY" = true ]; then
   if have arjun; then
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
-      arjun -u "$url" -oT "params/arjun_${name}.txt" -q 2>>"$LOGFILE" || true
+      timeout 60 arjun -u "$url" -oT "params/arjun_${name}.txt" -q 2>>"$LOGFILE" || true
     done < <(cap_list http/live_urls.txt 150 "Phase Arjun parameter discovery")
     ok "Arjun parameter discovery complete, see params/"
   else
@@ -753,7 +763,7 @@ if [ "$PARAM_DISCOVERY" = true ]; then
     # paramspider has no -o flag — it writes to its own ./results/<domain>.txt by default.
     # Run it, then move whatever it produced into our own output folder.
     while read -r d; do
-      ( cd params && paramspider -d "$d" >> "../logs/recon.log" 2>&1 ) || true
+      ( cd params && timeout 60 paramspider -d "$d" >> "../logs/recon.log" 2>&1 ) || true
     done < <(cap_list final/all_subs.txt 200 "Phase ParamSpider")
     [ -d params/results ] && mv params/results/* params/ 2>/dev/null && rmdir params/results 2>/dev/null
     ok "ParamSpider discovery complete, see params/"
@@ -778,9 +788,9 @@ if [ "$API_SCAN" = true ]; then
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
       if [ -n "$API_WORDLIST" ] && [ -f "$API_WORDLIST" ]; then
-        kr scan "$url" -w "$API_WORDLIST" --output json 2>>"$LOGFILE" > "api/kiterunner_${name}.json" || true
+        timeout 120 kr scan "$url" -w "$API_WORDLIST" --output json 2>>"$LOGFILE" > "api/kiterunner_${name}.json" || true
       else
-        kr scan "$url" -A=apiroutes-210228:20000 --output json 2>>"$LOGFILE" > "api/kiterunner_${name}.json" || true
+        timeout 120 kr scan "$url" -A=apiroutes-210228:20000 --output json 2>>"$LOGFILE" > "api/kiterunner_${name}.json" || true
       fi
     done < <(cap_list http/live_urls.txt 40 "Phase kiterunner (up to 20k routes PER host)")
     ok "kiterunner API route scan complete, see api/"
@@ -798,7 +808,7 @@ if [ -n "$FFUF_WORDLIST" ]; then
     mkdir -p urls/ffuf
     while read -r url; do
       name=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
-      ffuf -u "${url}/FUZZ" -w "$FFUF_WORDLIST" -mc 200,204,301,302,307,401,403 \
+      timeout 90 ffuf -u "${url}/FUZZ" -w "$FFUF_WORDLIST" -mc 200,204,301,302,307,401,403 \
         -silent -o "urls/ffuf/${name}.json" -of json 2>>"$LOGFILE" || true
     done < <(cap_list http/live_urls.txt 100 "Phase ffuf directory brute-force")
     ok "ffuf results saved to urls/ffuf/"
@@ -829,7 +839,7 @@ if [ "$JS_SCAN" = true ]; then
     if have linkfinder; then
       while read -r jsurl; do
         name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
-        linkfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/linkfinder_${name}.txt" || true
+        timeout 30 linkfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/linkfinder_${name}.txt" || true
       done < <(cap_list js/js_files.txt 300 "Phase LinkFinder")
       ok "LinkFinder endpoint extraction complete, see js/linkfinder_*.txt"
     else
@@ -838,7 +848,7 @@ if [ "$JS_SCAN" = true ]; then
     if have secretfinder; then
       while read -r jsurl; do
         name=$(echo "$jsurl" | sed 's#[^a-zA-Z0-9]#_#g')
-        secretfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/secretfinder_${name}.txt" || true
+        timeout 30 secretfinder -i "$jsurl" -o cli 2>>"$LOGFILE" >> "js/secretfinder_${name}.txt" || true
       done < <(cap_list js/js_files.txt 300 "Phase SecretFinder")
       ok "SecretFinder scan complete, see js/secretfinder_*.txt"
     else
@@ -863,12 +873,21 @@ if [ "$XSS_SCAN" = true ]; then
       # a safety margin against degraded network conditions (not dalfox being
       # unparallelized) — if requests are timing out due to network issues,
       # no amount of capping fully avoids a slow phase, only bounds it.
-      cap_list "$PARAM_URLS" 100 "Phase XSS" > xss/.capped_param_urls.txt
+      # Real-world runs showed this phase STILL running 17+ minutes even
+      # capped to 100 URLs, when the target is slow/rate-limiting (a 403
+      # instead of 200 on the target is a strong sign of that). Capping
+      # input count alone can't bound worst-case time when the SERVER itself
+      # is the bottleneck — only a hard wall-clock ceiling can. `timeout`
+      # guarantees this phase can never block the rest of the pipeline,
+      # whatever the network/target conditions are.
+      cap_list "$PARAM_URLS" 50 "Phase XSS" > xss/.capped_param_urls.txt
       start_heartbeat "Phase 19 XSS scan"
-      dalfox file xss/.capped_param_urls.txt --silence --timeout 8 -o xss/dalfox_results.txt 2>>"$LOGFILE" || true
+      timeout 300 dalfox file xss/.capped_param_urls.txt --silence --timeout 5 -o xss/dalfox_results.txt 2>>"$LOGFILE"
+      XSS_EXIT=$?
       stop_heartbeat
       rm -f xss/.capped_param_urls.txt
       XSS_COUNT=$(countf xss/dalfox_results.txt)
+      [ "$XSS_EXIT" -eq 124 ] && warn "XSS scan hit its 5-minute time limit (target may be slow/rate-limiting) — results below are PARTIAL, not a full scan"
       [ "$XSS_COUNT" -gt 0 ] && warn "Possible XSS finding(s): $XSS_COUNT — see xss/dalfox_results.txt" || ok "No XSS indicators found"
     else
       warn "No parameterized URLs found (run --crawl first) — skipping XSS scan"
@@ -1223,8 +1242,13 @@ log "Phase 30: Nuclei scan (severity: $SEVERITIES, rate-limit: $NUCLEI_RATE_LIMI
 # set against one host this can legitimately run 10+ minutes with zero visible
 # output, which looks identical to "hung". -stats is fully compatible with
 # -silent and prints a periodic one-line progress update instead.
-nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent -stats -stats-interval 20 \
+# A hard ceiling here too — the full template set (7000+ templates seen in
+# real runs) against a slow/rate-limiting target can run long even with
+# -stats showing real progress; 15 minutes is generous but bounded.
+timeout 900 nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent -stats -stats-interval 20 \
   -o vulns/nuclei_results.txt -je vulns/nuclei_results.json
+NUCLEI_EXIT=$?
+[ "$NUCLEI_EXIT" -eq 124 ] && warn "Nuclei hit its 15-minute time limit — results below are PARTIAL, not every template ran"
 FINDINGS=$(countf vulns/nuclei_results.txt)
 ok "Nuclei findings: $FINDINGS"
 
