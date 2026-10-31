@@ -1243,17 +1243,25 @@ fi
 # PHASE 30: Vulnerability Scanning (nuclei)
 # ========================================================================
 log "Phase 30: Nuclei scan (severity: $SEVERITIES, rate-limit: $NUCLEI_RATE_LIMIT req/s)"
-# -silent alone prints NOTHING until a finding shows up — on a full template
-# set against one host this can legitimately run 10+ minutes with zero visible
-# output, which looks identical to "hung". -stats is fully compatible with
-# -silent and prints a periodic one-line progress update instead.
-# A hard ceiling here too — the full template set (7000+ templates seen in
-# real runs) against a slow/rate-limiting target can run long even with
-# -stats showing real progress; 15 minutes is generous but bounded.
-timeout 900 nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent -stats -stats-interval 20 \
-  -o vulns/nuclei_results.txt -je vulns/nuclei_results.json
-NUCLEI_EXIT=$?
-[ "$NUCLEI_EXIT" -eq 124 ] && warn "Nuclei hit its 15-minute time limit — results below are PARTIAL, not every template ran"
+if [ ! -s http/live_urls.txt ]; then
+  # Running nuclei against an empty target list isn't just pointless — nuclei's
+  # own stats line divides by zero hosts and prints garbage like
+  # "Requests: 0/0 (9223372036854775808%)". Skip cleanly instead.
+  warn "No live hosts to scan (see Phase 9) — skipping nuclei entirely"
+  : > vulns/nuclei_results.txt
+else
+  # -silent alone prints NOTHING until a finding shows up — on a full template
+  # set against one host this can legitimately run 10+ minutes with zero visible
+  # output, which looks identical to "hung". -stats is fully compatible with
+  # -silent and prints a periodic one-line progress update instead.
+  # A hard ceiling here too — the full template set (7000+ templates seen in
+  # real runs) against a slow/rate-limiting target can run long even with
+  # -stats showing real progress; 15 minutes is generous but bounded.
+  timeout 900 nuclei -l http/live_urls.txt -s "$SEVERITIES" -rl "$NUCLEI_RATE_LIMIT" -c 25 -silent -stats -stats-interval 20 \
+    -o vulns/nuclei_results.txt -je vulns/nuclei_results.json
+  NUCLEI_EXIT=$?
+  [ "$NUCLEI_EXIT" -eq 124 ] && warn "Nuclei hit its 15-minute time limit — results below are PARTIAL, not every template ran"
+fi
 FINDINGS=$(countf vulns/nuclei_results.txt)
 ok "Nuclei findings: $FINDINGS"
 
